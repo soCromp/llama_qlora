@@ -54,11 +54,6 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Copied from LlamaForCausalLM forward()
-        Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         ```"""
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -81,17 +76,15 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         )
 
         hidden_states = outputs[0] #.to(input_ids.device)
+        print(hidden_states.shape)
         # self.lm_head = self.lm_head.to(hidden_states.device)
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
             logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
-            print('lm head on device', self.lm_head.weight.device, 'hidden_states on', hidden_states.device,
-              'input_ids', input_ids.device)
             logits = self.lm_head(hidden_states)
         logits = logits.float()
-        print('logits on device', logits.device, )
 
         loss = None
         if labels is not None:
@@ -105,8 +98,6 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
-        
-        print('loss done')
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -126,7 +117,6 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
     
     def generate(self, *args, **kwargs):
         """Generates output tokens. args empty; kwargs includes input_ids and attention_mask"""
-        print('success', 'args', args, 'kwargs', kwargs)
         # self.lm_head = self.heads[0].cuda(0)
         return super().generate(*args, **kwargs)
     
@@ -294,7 +284,6 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             if eos_token_id is not None:
                 if pad_token_id is None:
                     raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
-                print('next tokens', next_tokens.device, 'unfinished seqs', unfinished_sequences.device)
                 next_tokens = next_tokens.to(unfinished_sequences.device) * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
             # update generated ids, model inputs, and length for next step
