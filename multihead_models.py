@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import json
 import os
+from copy import deepcopy
 
 # structure: Peft model (Qlora) > Lora model (base_model)  > Normal model > Headless version of normal model
 # ohmodel: PeftModelForCausalLM             > LoraModel > LlamaForCausalLM          > LlamaModel
@@ -21,22 +22,21 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         super().__init__(config['llamamodel_config'])
         self.model = model # LlamaModel
         self.heads = heads
-        self.lm_head = heads[0]
+        # self.lm_head = heads[0]
         self.post_init()
+        self.lm_head = heads[0]
         
     
-    def from_other(othermodel, orighead, masks, vocabs, config):
-        assert len(masks) == len(vocabs)
-        return MultiheadLlamaForCausalLM(othermodel, [orighead], config)
-    
-    
-    def _add_head(self, orighead):
-        """in features and out features the same, but a mask will be applied at prediction.
-        Basically just a method to deep-copy the original head"""
-        in_features, out_features, bias = orighead.in_features, orighead.out_features, orighead.bias
-        newhead = type(orighead)(in_features, out_features, bias)
-        newhead.load_state_dict(orighead.state_dict())
-        self.heads.append(newhead)
+    def from_other(othermodel, orighead, masks, config):
+        heads=[]
+        
+        # in_features, out_features, bias = orighead.in_features, orighead.out_features, orighead.bias
+        # newhead = type(orighead)(in_features, out_features, bias)
+        # newhead.load_state_dict(orighead.state_dict())
+        # heads.append(newhead.to(orighead.weight.device))
+        heads.append(deepcopy(orighead))
+        
+        return MultiheadLlamaForCausalLM(othermodel, heads, config)
         
         
     def forward(
@@ -75,16 +75,16 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             return_dict=return_dict,
         )
 
-        hidden_states = outputs[0] #.to(input_ids.device)
+        hidden_states = outputs[0] # batch_size x max_tokens x 4096
         print(hidden_states.shape)
         # self.lm_head = self.lm_head.to(hidden_states.device)
         if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
+            return ValueError('unsupported hyperparameter pretraining tp > 1')
         else:
             logits = self.lm_head(hidden_states)
-        logits = logits.float()
+            
+        print(logits.shape)
+        logits = logits.float() # logits are batch_size x max_token_length x 32000 (vocab size)
 
         loss = None
         if labels is not None:
@@ -352,7 +352,7 @@ class MultiHeadPeftModelForCausalLM(PeftModelForCausalLM):
         normalmodel_config = {} 
         normalmodel_config['llamamodel_config'] = peft_model.base_model.model.config
         
-        normalmodel = MultiheadLlamaForCausalLM.from_other(headless_model, orighead, [], [], normalmodel_config) # replaces LlamaForCausalLM        
+        normalmodel = MultiheadLlamaForCausalLM.from_other(headless_model, orighead, head_masks, normalmodel_config) # replaces LlamaForCausalLM        
         mhmodel = MultiHeadPeftModelForCausalLM(peft_model.peft_config['default'], normalmodel)
         return mhmodel
         
