@@ -75,7 +75,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             return_dict=return_dict,
         )
 
-        hidden_states = outputs[0] # batch_size x max_tokens x 4096
+        hidden_states = outputs[0] # batch_size x tokens x 4096
         print(hidden_states.shape)
         # self.lm_head = self.lm_head.to(hidden_states.device)
         if self.config.pretraining_tp > 1:
@@ -84,7 +84,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             logits = self.lm_head(hidden_states)
             
         print(logits.shape)
-        logits = logits.float() # logits are batch_size x max_token_length x 32000 (vocab size)
+        logits = logits.float() # logits are batch_size x tokens x 32000 (vocab size)
 
         loss = None
         if labels is not None:
@@ -119,6 +119,9 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         """Generates output tokens. args empty; kwargs includes input_ids and attention_mask"""
         # self.lm_head = self.heads[0].cuda(0)
         return super().generate(*args, **kwargs)
+    
+    
+    def mlm_sample(): pass
     
     
     def greedy_search(
@@ -243,6 +246,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
+            print('model inputs', model_inputs['input_ids'].shape)
             # forward pass to get next token
             outputs = self(
                 **model_inputs,
