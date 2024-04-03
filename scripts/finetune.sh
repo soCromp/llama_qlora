@@ -1,7 +1,8 @@
 python qlora.py \
     --model_name_or_path /mnt/data/zoo/llama2/llama2-7b-hf/ \
+    --multihead 2 \
     --use_auth \
-    --output_dir /mnt/data/sonia/ckpts/sent1 \
+    --output_dir /mnt/data/sonia/ckpts/debug \
     --logging_steps 10 \
     --save_strategy steps \
     --data_seed 42 \
@@ -11,7 +12,7 @@ python qlora.py \
     --eval_dataset_size 1 \
     --max_eval_samples 1 \
     --per_device_eval_batch_size 1 \
-    --max_new_tokens 190 \
+    --max_new_tokens 60 \
     --dataloader_num_workers 1 \
     --group_by_length \
     --logging_strategy steps \
@@ -31,9 +32,9 @@ python qlora.py \
     --warmup_ratio 0.03 \
     --lr_scheduler_type constant \
     --gradient_checkpointing \
-    --dataset /mnt/data/sonia/honeygan/llama_format_feb27.dat \
-    --source_max_len 16 \
-    --target_max_len 512 \
+    --dataset /mnt/data/sonia/honeygan/llama_format_mar01.dat \
+    --source_max_len 60 \
+    --target_max_len 60 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --max_steps 60 \

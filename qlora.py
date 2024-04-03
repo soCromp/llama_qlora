@@ -52,6 +52,8 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from transformers.utils import is_peft_available
 from peft import PeftModel
 
+from multihead_models import MultiHeadPeftModelForCausalLM
+
 
 def is_ipex_available():
     def get_major_and_minor_from_version(full_version):
@@ -96,6 +98,10 @@ class ModelArguments:
     use_auth_token: Optional[bool] = field(
         default=False,
         metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
+    )
+    multihead: Optional[int] = field(
+        default=1,
+        metadata={'help': 'Number of heads (>=1) to put on the model. 1 results in normal model, more constructs multiheaded model.'}
     )
 
 @dataclass
@@ -334,6 +340,7 @@ def get_accelerate_model(args, checkpoint_dir):
 
 
     if args.full_finetune: assert args.bits in [16, 32]
+    assert args.multihead >= 1
 
     print(f'loading base model {args.model_name_or_path}...')
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
@@ -432,6 +439,11 @@ def get_accelerate_model(args, checkpoint_dir):
             if hasattr(module, 'weight'):
                 if args.bf16 and module.weight.dtype == torch.float32:
                     module = module.to(torch.bfloat16)
+
+    if args.multihead > 1:
+        ohmodel = model
+        model = MultiHeadPeftModelForCausalLM.from_one_head(ohmodel, args.multihead*[torch.ones(32000)], [1])
+
     return model, tokenizer
 
 def print_trainable_parameters(args, model):
@@ -722,7 +734,7 @@ def train():
     hfparser = transformers.HfArgumentParser((
         ModelArguments, DataArguments, TrainingArguments, GenerationArguments
     ))
-    model_args, data_args, training_args, generation_args, extra_args = \
+    model_args, data_args, training_args, generation_args   , extra_args = \
         hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
     training_args.generation_config = transformers.GenerationConfig(**vars(generation_args))
     args = argparse.Namespace(
