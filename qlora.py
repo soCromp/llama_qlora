@@ -440,9 +440,9 @@ def get_accelerate_model(args, checkpoint_dir):
                 if args.bf16 and module.weight.dtype == torch.float32:
                     module = module.to(torch.bfloat16)
 
-    if args.multihead > 1:
-        ohmodel = model
-        model = MultiHeadPeftModelForCausalLM.from_one_head(ohmodel, args.multihead*[torch.ones(32000)], [1])
+    # if args.multihead > 1:
+    # ohmodel = model
+    # model = MultiHeadPeftModelForCausalLM.from_one_head(ohmodel, args.multihead*[torch.ones(32000)], [1])
 
     return model, tokenizer
 
@@ -754,6 +754,9 @@ def train():
 
     data_module = make_data_module(tokenizer=tokenizer, args=args)
     
+    if args.multihead > 1:
+        do_mlm_sample=True # controls whether to do multihead-style sampling, will be passed as generation arg
+    
     if args.diversity:
         class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             def compute_loss(self, model, inputs, return_outputs=False):
@@ -825,12 +828,12 @@ def train():
                 trainer.model.eval()
                 # batch = next(iter(trainer.get_train_dataloader()))
                 # print(batch['input_ids'].shape) #labels
-                toks = trainer.tokenizer(['Server #5 is a ', 'Server #12 is a ', 'Server #678 is a ', 'Server #1904 is a '], return_tensors="pt", padding=True, truncation=True) #.input_ids 
+                toks = trainer.tokenizer(['Server #5 is a ', 'Server #12 is a ', 'Server #678 is a ', 'Server #1904 is a '], return_tensors="pt", padding=True, truncation=False) #.input_ids 
                     # ['There is a Ubuntu server visible at IP 43.205.13.243, port 22, offering the service cpe:/a:openbsd:openssh:8.2p1 Ubuntu-4ubuntu0.5.', 
                     #                       'There is a Ubuntu server visible at IP 43.205.13.243, port 443, offering the service cpe:/a:igor_sysoev:nginx.', 
                     #                       'There is a Windows (Build 6.3.9600) server visible at IP 206.233.189.205, port 80, offering the service cpe:/a:igor_sysoev:nginx.', 
                     #                       'There is a Windows (Build 10.0.14393) server visible at IP 155.93.175.136, port 25, offering the service cpe:/a:microsoft:exchange_server.'], 
-                    #     return_tensors="pt", padding=True, truncation=True) #.input_ids 
+                    #     return_tensors="pt", padding=True, truncation=True) #.input_ids
                 
                 outputs = model.generate(**toks, max_new_tokens=args.generation_config.max_new_tokens)
                 predictions= trainer.tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)

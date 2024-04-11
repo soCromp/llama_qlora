@@ -9,6 +9,7 @@ from transformers.deepspeed import is_deepspeed_zero3_enabled
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 import inspect
 import torch
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 import json
 import os
 from copy import deepcopy
@@ -25,9 +26,10 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         super().__init__(config['llamamodel_config'])
         self.model = model # LlamaModel
         self.heads = heads
-        # self.lm_head = heads[0]
-        self.post_init()
+        # self.config = config
         self.lm_head = heads[0]
+        self.post_init()
+        # self.lm_head = heads[0]
         
     
     def from_other(othermodel, orighead, masks, config):
@@ -76,14 +78,15 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         )
 
         hidden_states = outputs[0] # batch_size x tokens x 4096
-        print(hidden_states.shape)
+
         # self.lm_head = self.lm_head.to(hidden_states.device)
         if self.config.pretraining_tp > 1:
             return ValueError('unsupported hyperparameter pretraining tp > 1')
         else:
+            print(hidden_states.dtype, self.lm_head.weight.dtype)
             logits = self.lm_head(hidden_states)
             
-        print(logits.shape)
+
         logits = logits.float() # logits are batch_size x tokens x 32000 (vocab size)
 
         loss = None
@@ -318,13 +321,21 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         else:
             input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
 
-        if streamer is not None:
-            streamer.put(input_ids.cpu())
+        # if streamer is not None:
+        #     streamer.put(input_ids.cpu())
+        input_ids = input_ids.cuda()
 
         # 6. Prepare `max_length` depending on other stopping criteria.
-        input_ids_length = input_ids.shape[-1]
+        input_ids_seq_length = input_ids.shape[-1]
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
-        if generation_config.max_new_tokens is not None:
+        if has_default_max_length and generation_config.max_new_tokens is None:
+            warnings.warn(
+                f"Using `max_length`'s default ({generation_config.max_length}) to control the generation length. "
+                "This behaviour is deprecated and will be removed from the config in v5 of Transformers -- we"
+                " recommend using `max_new_tokens` to control the maximum length of the generation.",
+                UserWarning,
+            )
+        elif generation_config.max_new_tokens is not None:
             if not has_default_max_length:
                 logger.warning(
                     f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
@@ -332,14 +343,88 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                     "Please refer to the documentation for more information. "
                     "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
                 )
-            generation_config.max_length = generation_config.max_new_tokens + input_ids_length
-        self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+            generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
+
+        if generation_config.min_length is not None and generation_config.min_length > generation_config.max_length:
+            raise ValueError(
+                f"Unfeasible length constraints: the minimum length ({generation_config.min_length}) is larger than"
+                f" the maximum length ({generation_config.max_length})"
+            )
+        if input_ids_seq_length >= generation_config.max_length:
+            input_ids_string = "decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+            logger.warning(
+                f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
+                f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
+                " increasing `max_new_tokens`."
+            )
 
         # 7. determine generation mode
-        if do_mlm_sample:
-            generation_mode = 'MLM_SAMPLE'
-        else:
-            generation_mode = self._get_generation_mode(generation_config, assistant_model)
+        # if do_mlm_sample:
+        #     generation_mode = 'MLM_SAMPLE'
+        is_mlm_mode = do_mlm_sample
+        # else:
+        is_constraint_gen_mode = (
+            generation_config.constraints is not None or generation_config.force_words_ids is not None
+        )
+
+        is_contrastive_search_gen_mode = (
+            (generation_config.num_beams == 1)
+            and generation_config.top_k is not None
+            and generation_config.top_k > 1
+            and generation_config.do_sample is False
+            and generation_config.penalty_alpha is not None
+            and generation_config.penalty_alpha > 0
+        )
+
+        is_greedy_gen_mode = (
+            (generation_config.num_beams == 1)
+            and (generation_config.num_beam_groups == 1)
+            and generation_config.do_sample is False
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
+        )
+        is_sample_gen_mode = (
+            (generation_config.num_beams == 1)
+            and (generation_config.num_beam_groups == 1)
+            and generation_config.do_sample is True
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
+        )
+        is_beam_gen_mode = (
+            (generation_config.num_beams > 1)
+            and (generation_config.num_beam_groups == 1)
+            and generation_config.do_sample is False
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
+        )
+        is_beam_sample_gen_mode = (
+            (generation_config.num_beams > 1)
+            and (generation_config.num_beam_groups == 1)
+            and generation_config.do_sample is True
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
+        )
+        is_group_beam_gen_mode = (
+            (generation_config.num_beams > 1)
+            and (generation_config.num_beam_groups > 1)
+            and not is_constraint_gen_mode
+            and not is_contrastive_search_gen_mode
+        )
+        is_assisted_gen_mode = False
+        if assistant_model is not None:
+            if not (is_greedy_gen_mode or is_sample_gen_mode):
+                raise ValueError(
+                    "You've set `assistant_model`, which triggers assisted generate. Currently, assisted generate "
+                    "is only supported with Greedy Search and Sample."
+                )
+            is_assisted_gen_mode = True
+
+        if generation_config.num_beam_groups > generation_config.num_beams:
+            raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
+        if is_group_beam_gen_mode and generation_config.do_sample is True:
+            raise ValueError(
+                "Diverse beam search cannot be used in sampling mode. Make sure that `do_sample` is set to `False`."
+            )
 
         if streamer is not None and (generation_config.num_beams > 1):
             raise ValueError(
@@ -360,13 +445,10 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         # 8. prepare distribution pre_processing samplers
         logits_processor = self._get_logits_processor(
             generation_config=generation_config,
-            input_ids_seq_length=input_ids_length,
+            input_ids_seq_length=input_ids_seq_length,
             encoder_input_ids=inputs_tensor,
             prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
             logits_processor=logits_processor,
-            model_kwargs=model_kwargs,
-            negative_prompt_ids=negative_prompt_ids,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
         )
 
         # 9. prepare stopping criteria
@@ -374,7 +456,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             generation_config=generation_config, stopping_criteria=stopping_criteria
         )
         # 10. go into different generation modes
-        if generation_mode == 'MLM_SAMPLE':
+        if is_mlm_mode:
             # 11. run mlm sample
             return self.mlm_sample(
                 input_ids,
@@ -388,7 +470,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 streamer=streamer,
                 **model_kwargs,
             )
-        if generation_mode == GenerationMode.ASSISTED_GENERATION:
+        if is_assisted_gen_mode:
             if generation_config.num_return_sequences > 1:
                 raise ValueError(
                     "num_return_sequences has to be 1 when doing assisted generate, "
@@ -426,7 +508,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 streamer=streamer,
                 **model_kwargs,
             )
-        if generation_mode == GenerationMode.GREEDY_SEARCH:
+        if is_greedy_gen_mode:
             # 11. run greedy search
             return self.greedy_search(
                 input_ids,
@@ -441,7 +523,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 **model_kwargs,
             )
 
-        elif generation_mode == GenerationMode.CONTRASTIVE_SEARCH:
+        elif is_contrastive_search_gen_mode:
             if not model_kwargs["use_cache"]:
                 raise ValueError("Contrastive search requires `use_cache=True`")
 
@@ -461,7 +543,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 **model_kwargs,
             )
 
-        elif generation_mode == GenerationMode.SAMPLE:
+        elif is_sample_gen_mode:
             # 11. prepare logits warper
             logits_warper = self._get_logits_warper(generation_config)
 
@@ -488,7 +570,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 **model_kwargs,
             )
 
-        elif generation_mode == GenerationMode.BEAM_SEARCH:
+        elif is_beam_gen_mode:
             # 11. prepare beam search scorer
             beam_scorer = BeamSearchScorer(
                 batch_size=batch_size,
@@ -520,7 +602,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 **model_kwargs,
             )
 
-        elif generation_mode == GenerationMode.BEAM_SAMPLE:
+        elif is_beam_sample_gen_mode:
             # 11. prepare logits warper
             logits_warper = self._get_logits_warper(generation_config)
 
@@ -558,7 +640,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 **model_kwargs,
             )
 
-        elif generation_mode == GenerationMode.GROUP_BEAM_SEARCH:
+        elif is_group_beam_gen_mode:
             # 11. prepare beam search scorer
             beam_scorer = BeamSearchScorer(
                 batch_size=batch_size,
@@ -591,7 +673,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 **model_kwargs,
             )
 
-        elif generation_mode == GenerationMode.CONSTRAINED_BEAM_SEARCH:
+        elif is_constraint_gen_mode:
             final_constraints = []
             if generation_config.constraints is not None:
                 final_constraints = generation_config.constraints
@@ -915,6 +997,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
                 `return_dict_in_generate=True` or a [`~generation.GreedySearchEncoderDecoderOutput`] if
                 `model.config.is_encoder_decoder=True`.
             ```"""
+        input_ids = input_ids.cuda()
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
@@ -974,7 +1057,7 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-            print('model inputs', model_inputs['input_ids'].shape)
+
             # forward pass to get next token
             outputs = self(
                 **model_inputs,
@@ -1079,7 +1162,7 @@ class MultiHeadPeftModelForCausalLM(PeftModelForCausalLM):
             head_masks: a list of masks for head output vocabulary,
             head_max_tokens: a list of ints, where the nth element is the 
                         max number of new tokens to be generated by the nth head"""
-        print('ohmodel type', type(peft_model))
+
         headless_model = peft_model.base_model.model.model #LlamaModel
         orighead = peft_model.base_model.model.lm_head
         normalmodel_config = {} 
@@ -1091,6 +1174,7 @@ class MultiHeadPeftModelForCausalLM(PeftModelForCausalLM):
         
         
     def generate(self, *args, **kwargs):
+
         self.base_model.prepare_inputs_for_generation = self.prepare_inputs_for_generation
         if hasattr(self.base_model, "model"):
             self.base_model.model.generation_config = self.generation_config
