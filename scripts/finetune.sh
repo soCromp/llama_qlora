@@ -9,8 +9,8 @@ python qlora.py \
     --save_steps 5 \
     --save_total_limit 40 \
     --evaluation_strategy steps \
-    --eval_dataset_size 1 \
-    --max_eval_samples 1 \
+    --eval_dataset_size 5 \
+    --max_eval_samples 100 \
     --per_device_eval_batch_size 1 \
     --max_new_tokens 60 \
     --dataloader_num_workers 1 \

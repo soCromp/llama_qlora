@@ -826,22 +826,33 @@ def train():
         class evalSampleCallback(transformers.TrainerCallback):
             def on_evaluate(self, args, state, control, model, **kwargs):
                 trainer.model.eval()
+                dl = trainer.get_eval_dataloader()
                 # batch = next(iter(trainer.get_train_dataloader()))
                 # print(batch['input_ids'].shape) #labels
-                toks = trainer.tokenizer(['Server #5 is a ', 'Server #12 is a ', 'Server #678 is a ', 'Server #1904 is a '], return_tensors="pt", padding=True, truncation=False) #.input_ids 
+                # toks = trainer.tokenizer(['Server #5 is a ', 'Server #12 is a ', 'Server #678 is a ', 'Server #1904 is a '], return_tensors="pt", padding=True, truncation=False) #.input_ids 
                     # ['There is a Ubuntu server visible at IP 43.205.13.243, port 22, offering the service cpe:/a:openbsd:openssh:8.2p1 Ubuntu-4ubuntu0.5.', 
                     #                       'There is a Ubuntu server visible at IP 43.205.13.243, port 443, offering the service cpe:/a:igor_sysoev:nginx.', 
                     #                       'There is a Windows (Build 6.3.9600) server visible at IP 206.233.189.205, port 80, offering the service cpe:/a:igor_sysoev:nginx.', 
                     #                       'There is a Windows (Build 10.0.14393) server visible at IP 155.93.175.136, port 25, offering the service cpe:/a:microsoft:exchange_server.'], 
                     #     return_tensors="pt", padding=True, truncation=True) #.input_ids
                 
-                outputs = model.generate(**toks, max_new_tokens=args.generation_config.max_new_tokens)
-                predictions= trainer.tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                # outputs = model.generate(**toks, max_new_tokens=args.generation_config.max_new_tokens)
+                predictions = []
+                for batch in dl:
+                    print(batch)
+                    loss, logits, labels = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
+                    labels = labels[labels != IGNORE_INDEX]#.view(-1, 2)[:,0]
+                    print(labels)
+                    predictions.append(
+                        ''.join(trainer.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n')
+                    predictions.append(
+                        ''.join(trainer.tokenizer.decode(labels, skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n')
                 
                 with open(os.path.join(args.output_dir, 'samples.txt'), 'a') as f:
                     f.write(f'step {trainer.state.global_step}\n')
-                    f.write('\n'.join(predictions))
+                    f.writelines(predictions)
                     f.write('\n\n')
+                    
                 print('\nsamples logged to ', os.path.join(args.output_dir, 'samples.txt'))
                 
         trainer.add_callback(evalSampleCallback)
