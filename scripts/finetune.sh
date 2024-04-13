@@ -1,6 +1,6 @@
 python qlora.py \
     --model_name_or_path /mnt/data/zoo/llama2/llama2-7b-hf/ \
-    --multihead 2 \
+    --multihead 1 \
     --use_auth \
     --output_dir /mnt/data/sonia/ckpts/debug \
     --logging_steps 10 \

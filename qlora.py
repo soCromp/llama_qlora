@@ -136,7 +136,7 @@ class DataArguments:
         metadata={"help": "Which dataset to finetune on. See datamodule for options."}
     )
     dataset_format: Optional[str] = field(
-        default=None,
+        default="inout",
         metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf|inout]"}
     )
 
@@ -637,7 +637,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         elif dataset_name == 'vicuna':
             raise NotImplementedError("Vicuna data was not released.")
         elif os.path.exists(dataset_name):
-            args.dataset_format = args.dataset_format if args.dataset_format else "inout"
+            # args.dataset_format is  "inout" by default
             return local_dataset(dataset_name)
         else:
             raise NotImplementedError(f"Dataset {dataset_name} not implemented yet.")
@@ -839,12 +839,12 @@ def train():
                 # outputs = model.generate(**toks, max_new_tokens=args.generation_config.max_new_tokens)
                 predictions = []
                 for batch in dl:
-                    print(batch)
+                    # print(batch)
                     loss, logits, labels = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
                     labels = labels[labels != IGNORE_INDEX]#.view(-1, 2)[:,0]
-                    print(labels)
-                    predictions.append(
-                        ''.join(trainer.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n')
+                    # print(labels)
+                    # predictions.append(
+                    #     ''.join(trainer.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n')
                     predictions.append(
                         ''.join(trainer.tokenizer.decode(labels, skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n')
                 
