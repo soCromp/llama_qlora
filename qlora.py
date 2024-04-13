@@ -826,13 +826,17 @@ def train():
         class evalSampleCallback(transformers.TrainerCallback):
             def on_evaluate(self, args, state, control, model, **kwargs):
                 trainer.model.eval()
-                dl = trainer.get_eval_dataloader()
+                metrics = trainer.predict(test_dataset=data_module['eval_dataset'],metric_key_prefix="predict")
+                
                 predictions = []
-                for batch in dl:
-                    loss, logits, labels = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
-                    labels = labels[labels != IGNORE_INDEX] 
+                for i in range(len(metrics.predictions)):
+                    logit = metrics.predictions[i]
+                    label = metrics.label_ids[i] #just to see positions where prompt tokens are at
+                    logit_abcd = logit[label != IGNORE_INDEX]
+                    toks = np.argmax(logit_abcd, axis=1)
                     predictions.append(
-                        ''.join(trainer.tokenizer.decode(labels, skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n')
+                        ''.join(trainer.tokenizer.decode(toks, skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n'
+                        )
                 
                 with open(os.path.join(args.output_dir, 'samples.txt'), 'a') as f:
                     f.write(f'step {trainer.state.global_step}\n')
