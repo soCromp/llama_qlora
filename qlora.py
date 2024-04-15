@@ -370,7 +370,6 @@ def get_accelerate_model(args, checkpoint_dir):
             ),
             torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
         )
-        print('here')
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
