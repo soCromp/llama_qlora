@@ -83,7 +83,6 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         self.heads = nn.ModuleList(headlist)
         
         self.post_init() # Initialize weights and apply final processing
-        print(self)
         
         
     def from_one_head(ohmodel, num_heads):
