@@ -1,5 +1,5 @@
 from peft import AutoPeftModelForCausalLM, PeftModelForCausalLM, get_peft_config, LoraModel
-from transformers import AutoTokenizer, LlamaTokenizer, AutoModelForCausalLM, LlamaForCausalLM
+from transformers import AutoTokenizer, LlamaTokenizer, LlamaPreTrainedModel, AutoModelForCausalLM, LlamaForCausalLM, LlamaModel, LlamaConfig
 from transformers.generation.utils import * # GreedySearchEncoderDecoderOutput, GreedySearchDecoderOnlyOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.logits_process import LogitsProcessorList
@@ -9,7 +9,7 @@ from transformers.deepspeed import is_deepspeed_zero3_enabled
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 import inspect
 import torch
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss, ModuleList, Linear
 import json
 import os
 from copy import deepcopy
@@ -21,18 +21,82 @@ from copy import deepcopy
 GreedySearchOutput = Union[GreedySearchEncoderDecoderOutput, GreedySearchDecoderOnlyOutput]
 
 
-class MultiheadLlamaForCausalLM(LlamaForCausalLM):
-    def __init__(self, model, heads, config):
-        super().__init__(config['llamamodel_config'])
-        self.model = model # LlamaModel
-        self.heads = heads
-        # self.config = config
-        self.lm_head = heads[0]
-        self.post_init()
-        # self.lm_head = heads[0]
+class MHLlamaConfig(LlamaConfig):
+    model_type = "mhllama"
+    
+    def __init__(
+            self,
+            num_heads=1,
+            vocab_size=32000,
+            hidden_size=4096,
+            intermediate_size=11008,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=None,
+            hidden_act="silu",
+            max_position_embeddings=2048,
+            initializer_range=0.02,
+            rms_norm_eps=1e-6,
+            use_cache=True,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            pretraining_tp=1,
+            tie_word_embeddings=False,
+            rope_scaling=None,
+        **kwargs,):
+        super().__init__(
+            vocab_size=32000,
+            hidden_size=4096,
+            intermediate_size=11008,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=None,
+            hidden_act="silu",
+            max_position_embeddings=2048,
+            initializer_range=0.02,
+            rms_norm_eps=1e-6,
+            use_cache=True,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            pretraining_tp=1,
+            tie_word_embeddings=False,
+            rope_scaling=None,
+        **kwargs,)
+        self.num_heads = num_heads
+
+
+class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
+    config_class = MHLlamaConfig
+    _tied_weights_keys = []
+    
+    def __init__(self, config):
+        super().__init__(config) #['llamamodel_config']
+        self.model = LlamaModel(config)
+        self.pretraining_tp = config.pretraining_tp
+        self.vocab_size = config.vocab_size
+        
+        headlist = []
+        for i in range(config.num_heads):
+            headlist.append( nn.Linear(config.hidden_size, config.vocab_size, bias=False) )
+        self.heads = nn.ModuleList(headlist)
+        
+        self.post_init() # Initialize weights and apply final processing
+        print(self)
+        
+        
+    def from_one_head(ohmodel, num_heads):
+        orighead = ohmodel.lm_head
+        heads = []
+        for i in range(num_heads):
+            heads.append(deepcopy(orighead))
+            
+        return MultiheadLlamaForCausalLM(ohmodel.model, heads, ohmodel.config)
         
     
-    def from_other(othermodel, orighead, masks, config):
+    def from_other(othermodel, orighead, masks, config): 
+        """Legacy code"""
         heads=[]
         
         for i in range(len(masks)):
@@ -40,7 +104,26 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         
         return MultiheadLlamaForCausalLM(othermodel, heads, config)
         
-        
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.heads
+
+    def set_output_embeddings(self, new_embeddings):
+        self.heads = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+    
+    
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -83,7 +166,6 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
         if self.config.pretraining_tp > 1:
             return ValueError('unsupported hyperparameter pretraining tp > 1')
         else:
-            print(hidden_states.dtype, self.lm_head.weight.dtype)
             logits = self.lm_head(hidden_states)
             
 
@@ -1151,37 +1233,78 @@ class MultiheadLlamaForCausalLM(LlamaForCausalLM):
             return input_ids
 
 
-class MultiHeadPeftModelForCausalLM(PeftModelForCausalLM):
-    def __init__(self, config, base_model):
-        super().__init__(base_model, config) #sets self.base_model to base_model
-        self.config = config
-    
-    
-    def from_one_head(peft_model, head_masks, head_max_tokens, *args, **kwargs):
-        """peft_model: A PeftModelForCausalLM,
-            head_masks: a list of masks for head output vocabulary,
-            head_max_tokens: a list of ints, where the nth element is the 
-                        max number of new tokens to be generated by the nth head"""
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        if past_key_values:
+            input_ids = input_ids[:, -1:]
 
-        headless_model = peft_model.base_model.model.model #LlamaModel
-        orighead = peft_model.base_model.model.lm_head
-        normalmodel_config = {} 
-        normalmodel_config['llamamodel_config'] = peft_model.base_model.model.config
-        
-        normalmodel = MultiheadLlamaForCausalLM.from_other(headless_model, orighead, head_masks, normalmodel_config) # replaces LlamaForCausalLM        
-        mhmodel = MultiHeadPeftModelForCausalLM(peft_model.peft_config['default'], normalmodel)
-        return mhmodel
-        
-        
-    def generate(self, *args, **kwargs):
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
 
-        self.base_model.prepare_inputs_for_generation = self.prepare_inputs_for_generation
-        if hasattr(self.base_model, "model"):
-            self.base_model.model.generation_config = self.generation_config
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            self.base_model.generation_config = self.generation_config
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
+
+
+# class MultiHeadPeftModelForCausalLM(PeftModelForCausalLM):
+#     def __init__(self, config, base_model):
+#         super().__init__(base_model, config) #sets self.base_model to base_model
+#         self.config = config
+    
+    
+#     def from_one_head(peft_model, head_masks, head_max_tokens, *args, **kwargs):
+#         """peft_model: A PeftModelForCausalLM,
+#             head_masks: a list of masks for head output vocabulary,
+#             head_max_tokens: a list of ints, where the nth element is the 
+#                         max number of new tokens to be generated by the nth head"""
+
+#         headless_model = peft_model.base_model.model.model #LlamaModel
+#         orighead = peft_model.base_model.model.lm_head
+#         normalmodel_config = {} 
+#         normalmodel_config['llamamodel_config'] = peft_model.base_model.model.config
+        
+#         normalmodel = MultiheadLlamaForCausalLM.from_other(headless_model, orighead, head_masks, normalmodel_config) # replaces LlamaForCausalLM        
+#         mhmodel = MultiHeadPeftModelForCausalLM(peft_model.peft_config['default'], normalmodel)
+#         return mhmodel
+        
+        
+#     def generate(self, *args, **kwargs):
+
+#         self.base_model.prepare_inputs_for_generation = self.prepare_inputs_for_generation
+#         if hasattr(self.base_model, "model"):
+#             self.base_model.model.generation_config = self.generation_config
+#         else:
+#             self.base_model.generation_config = self.generation_config
             
-        outputs = self.base_model.generate(*args, **kwargs)
-        return outputs
+#         outputs = self.base_model.generate(*args, **kwargs)
+#         return outputs
         
         

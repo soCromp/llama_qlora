@@ -32,7 +32,8 @@ from transformers import (
     set_seed,
     Seq2SeqTrainer,
     BitsAndBytesConfig,
-    LlamaTokenizer
+    LlamaTokenizer,
+    LlamaConfig
 
 )
 from datasets import load_dataset, Dataset, load_from_disk
@@ -52,7 +53,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from transformers.utils import is_peft_available
 from peft import PeftModel
 
-from multihead_models import MultiHeadPeftModelForCausalLM
+from multihead_models import MultiheadLlamaForCausalLM, MHLlamaConfig
 
 
 def is_ipex_available():
@@ -344,26 +345,55 @@ def get_accelerate_model(args, checkpoint_dir):
 
     print(f'loading base model {args.model_name_or_path}...')
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        cache_dir=args.cache_dir,
-        load_in_4bit=args.bits == 4,
-        load_in_8bit=args.bits == 8,
-        device_map=device_map,
-        max_memory=max_memory,
-        quantization_config=BitsAndBytesConfig(
+    
+    model = None
+    if args.multihead > 1:
+        # config = MHLlamaConfig(**vars(args))
+        # model = MultiheadLlamaForCausalLM(args.multihead, config)
+        transformers.AutoConfig.register('mhllama', MHLlamaConfig)
+        transformers.AutoModelForCausalLM.register(MHLlamaConfig, MultiheadLlamaForCausalLM)
+        model = AutoModelForCausalLM.from_pretrained(
+            '/home/sonia/llama-qlora/mhllama',
+            cache_dir=args.cache_dir,
+            # load_in_4bit=args.bits == 4,
+            # load_in_8bit=args.bits == 8,
+            device_map=device_map,
+            max_memory=max_memory,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=args.bits == 4,
+                load_in_8bit=args.bits == 8,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=args.double_quant,
+                bnb_4bit_quant_type=args.quant_type,
+            ),
+            torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        )
+        print('here')
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            cache_dir=args.cache_dir,
             load_in_4bit=args.bits == 4,
             load_in_8bit=args.bits == 8,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-            bnb_4bit_compute_dtype=compute_dtype,
-            bnb_4bit_use_double_quant=args.double_quant,
-            bnb_4bit_quant_type=args.quant_type,
-        ),
-        torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
-        trust_remote_code=args.trust_remote_code,
-        use_auth_token=args.use_auth_token
-    )
+            device_map=device_map,
+            max_memory=max_memory,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=args.bits == 4,
+                load_in_8bit=args.bits == 8,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=args.double_quant,
+                bnb_4bit_quant_type=args.quant_type,
+            ),
+            torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+            trust_remote_code=args.trust_remote_code,
+            # use_auth_token=args.use_auth_token
+        )
+        print(model)
+        
     if compute_dtype == torch.float16 and args.bits == 4:
         if torch.cuda.is_bf16_supported():
             print('='*80)
@@ -419,6 +449,7 @@ def get_accelerate_model(args, checkpoint_dir):
         else:
             print(f'adding LoRA modules...')
             modules = find_all_linear_names(args, model)
+            print(modules)
             config = LoraConfig(
                 r=args.lora_r,
                 lora_alpha=args.lora_alpha,
@@ -439,10 +470,6 @@ def get_accelerate_model(args, checkpoint_dir):
             if hasattr(module, 'weight'):
                 if args.bf16 and module.weight.dtype == torch.float32:
                     module = module.to(torch.bfloat16)
-
-    # if args.multihead > 1:
-    # ohmodel = model
-    # model = MultiHeadPeftModelForCausalLM.from_one_head(ohmodel, args.multihead*[torch.ones(32000)], [1])
 
     return model, tokenizer
 
