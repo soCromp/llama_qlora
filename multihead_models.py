@@ -106,12 +106,14 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
     
     
     def get_heads_logits(self, hidden_states, cloze_indices):
-        headout = torch.zeros((hidden_states[0], hidden_states[1], self.config.vocab_size), dtype=hidden_states.dtype)
-        cloze_guesses = torch.zeros((hidden_states[0], cloze_indices, self.config.vocab_size), dtype=hidden_states.dtype)
+        headout = torch.zeros(hidden_states.shape[0], hidden_states.shape[1], self.config.vocab_size, 
+                              dtype=hidden_states.dtype, device=hidden_states.device)
+        cloze_guesses = torch.zeros(hidden_states.shape[0], cloze_indices.shape[0], self.config.vocab_size, 
+                                dtype=hidden_states.dtype, device=hidden_states.device)
         for i in range(self.num_heads):
             pred = self.heads[i](hidden_states)
-            headout += pred / self.num_heads
-            cloze_guesses[:, i, :] = pred[:, -1, vocab_size]
+            headout += pred / torch.as_tensor(self.num_heads, device=pred.device)
+            cloze_guesses[:, i, :] = pred[:, -1, :]
         headout[:, cloze_indices, :] = cloze_guesses
         return headout
     
@@ -153,12 +155,13 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         )
 
         hidden_states = outputs[0] # batch_size x tokens x 4096
-        print(hidden_states.shape)
+        # print(hidden_states.shape)
 
         if self.config.pretraining_tp > 1:
             return ValueError('unsupported hyperparameter pretraining tp > 1')
         else:
-            logits = self.get_heads_logits(hidden_states)
+            locs_batch, locs_tok = torch.where(input_ids==3695) #special mask token ~
+            logits = self.get_heads_logits(hidden_states, locs_tok[locs_batch==0]+1)
             
 
         logits = logits.float() # logits are batch_size x tokens x 32000 (vocab size)

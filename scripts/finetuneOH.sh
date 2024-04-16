@@ -1,8 +1,8 @@
 python qlora.py \
     --model_name_or_path /mnt/data/zoo/llama2/llama2-7b-hf/ \
-    --multihead 4 \
+    --multihead 1 \
     --use_auth \
-    --output_dir /mnt/data/sonia/ckpts/cloze \
+    --output_dir /mnt/data/sonia/ckpts/debug \
     --logging_steps 10 \
     --save_strategy steps \
     --data_seed 42 \
@@ -32,7 +32,7 @@ python qlora.py \
     --warmup_ratio 0.03 \
     --lr_scheduler_type constant \
     --gradient_checkpointing \
-    --dataset /mnt/data/sonia/honeygan/cloze_apr13.dat \
+    --dataset /mnt/data/sonia/honeygan/llama_format_mar01.dat \
     --source_max_len 60 \
     --target_max_len 150 \
     --per_device_train_batch_size 1 \

@@ -96,10 +96,10 @@ class ModelArguments:
         default=False,
         metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
     )
-    use_auth_token: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
-    )
+    # use_auth_token: Optional[bool] = field(
+    #     default=False,
+    #     metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
+    # )
     multihead: Optional[int] = field(
         default=1,
         metadata={'help': 'Number of heads (>=1) to put on the model. 1 results in normal model, more constructs multiheaded model.'}
@@ -416,7 +416,7 @@ def get_accelerate_model(args, checkpoint_dir):
         use_fast=False, # Fast tokenizer giving issues.
         tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
         trust_remote_code=args.trust_remote_code,
-        use_auth_token=args.use_auth_token,
+        # use_auth_token=args.use_auth_token,
     )
     if tokenizer._pad_token is None:
         smart_tokenizer_and_embedding_resize(
@@ -766,7 +766,6 @@ def train():
     args = argparse.Namespace(
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
-    print(args)
     
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
     if completed_training:
