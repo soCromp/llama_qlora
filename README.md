@@ -2,6 +2,8 @@ Based on the QLoRA repo
 
 # Setup
 
+## Environment
+
 `conda env create -f environment.yml`
 
 Make sure to install huggingface version of transformers:
@@ -32,3 +34,7 @@ if dtype == torch.bfloat16:
 
 **Second**: 
 Change `transformers/modeling_utils.py` line 1089 to `param.numel() * 2 * torch.tensor(1, dtype=self.hf_quantizer.quantization_config.bnb_4bit_quant_storage).element_size()`.
+
+## Model registration
+
+Run through `multihead.ipynb`, updating file paths where necessary.
