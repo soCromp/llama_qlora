@@ -1,6 +1,8 @@
 Based on the QLoRA repo
 
-Setup: `conda env create -f environment.yml`
+# Setup
+
+`conda env create -f environment.yml`
 
 Make sure to install huggingface version of transformers:
 ```shell
@@ -14,7 +16,9 @@ https://huggingface.co/DiscoResearch/mixtral-7b-8expert/discussions/9
 
 (Updating environment.yml): `conda list --explicit > environment.yml`
 
-Bug modification: in `transformers/models/llama/modeling_llama.py`, to avoid datatype issues, change line 1075 (of `LlamaModel._update_causal_mask`) from
+## Bug modification
+
+**First**: in `transformers/models/llama/modeling_llama.py`, to avoid datatype issues, change line 1075 (of `LlamaModel._update_causal_mask`) from
 ```python
 causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
 ```
@@ -26,3 +30,5 @@ if dtype == torch.bfloat16:
             causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
 ```
 
+**Second**: 
+Change `transformers/modeling_utils.py` line 1089 to `param.numel() * 2 * torch.tensor(1, dtype=self.hf_quantizer.quantization_config.bnb_4bit_quant_storage).element_size()`.
