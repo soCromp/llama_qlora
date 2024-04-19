@@ -1,4 +1,4 @@
-Based on the QLoRA repo
+Based on the [QLoRA repo](https://github.com/artidoro/qlora)
 
 # Setup
 

@@ -27,6 +27,8 @@ class MHLlamaConfig(LlamaConfig):
     def __init__(
             self,
             num_heads=1,
+            head_assembly='follow',
+            head_loss='rearrange',
             vocab_size=32000,
             hidden_size=4096,
             intermediate_size=11008,
@@ -65,6 +67,8 @@ class MHLlamaConfig(LlamaConfig):
             rope_scaling=None,
         **kwargs,)
         self.num_heads = num_heads
+        self.head_assembly = head_assembly
+        self.head_loss = head_loss
 
 
 class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
@@ -79,8 +83,10 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         self.num_heads = config.num_heads
         
         headlist = []
+        # self.heads = nn.ModuleList()
         for i in range(config.num_heads):
-            headlist.append( nn.Linear(config.hidden_size, config.vocab_size, bias=False) )
+            # self.heads.add_module(f'lm_head_{i}', nn.Linear(config.hidden_size, config.vocab_size, bias=False))
+            headlist.append(  nn.Linear(config.hidden_size, config.vocab_size, bias=False)) 
         self.heads = nn.ModuleList(headlist)
         
         self.post_init() # Initialize weights and apply final processing
@@ -108,8 +114,6 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
     
     def get_heads_logits(self, hidden_states, cloze_indices, return_individual_preds=False):
         """return_individual_preds is if you want to see what is output by each individual head"""
-        print('cloze indices', cloze_indices, )
-        print('shape', cloze_indices.shape)
         headout = torch.zeros(hidden_states.shape[0], hidden_states.shape[1], self.config.vocab_size, 
                               dtype=hidden_states.dtype, device=hidden_states.device)
         cloze_guesses = torch.zeros(hidden_states.shape[0], cloze_indices.shape[0], self.config.vocab_size, 
@@ -123,10 +127,10 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             headout += pred / torch.as_tensor(self.num_heads, device=pred.device)
             cloze_guesses[:, i, :] = pred[:, -1, :]
         headout[:, cloze_indices, :] = cloze_guesses
-        if return_individual_preds:
-            return headout, preds
-        else: 
-            return headout
+        # if return_individual_preds:
+        #     return headout, preds
+        # else: 
+        return headout
     
     
     def forward(
@@ -201,7 +205,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=hidden_states, #outputs.hidden_states,
+            hidden_states=outputs.hidden_states, #hidden_states, #
             attentions=outputs.attentions,
         )
         

@@ -96,13 +96,18 @@ class ModelArguments:
         default=False,
         metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
     )
-    # use_auth_token: Optional[bool] = field(
-    #     default=False,
-    #     metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
-    # )
     num_heads: Optional[int] = field(
         default=1,
         metadata={'help': 'Number of heads (>=1) to put on the model. 1 results in normal model, more constructs multiheaded model.'}
+    )
+    head_assembly: Optional[str] = field(
+        default='follow',
+        metadata={'help': 'Whether heads should re-generate the input tokens and where to put their column predictions relative to the (if any) input tokens. One of: \
+            follow (follow prompt), just (just column preds) or correct (put inside the prompt)'}
+    )
+    head_loss: Optional[str] = field(
+        default='rearrange',
+        metadata={'help': 'How to compare head outputs to the labels. One of: rearrange (insert into cloze prompt sentence), pull (pull out of cloze prompt sentence)'}
     )
 
 @dataclass
@@ -288,10 +293,15 @@ def find_all_linear_names(args, model):
         if isinstance(module, cls):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
-
-    if 'lm_head' in lora_module_names: # needed for 16-bit
-        lora_module_names.remove('lm_head')
+        # elif 'heads.' in name:
+        #     names = name.split('.')
+        #     lora_module_names.add(names[-1])
+    
+    if args.num_heads > 1:
+        for i in range(args.num_heads):
+            lora_module_names.add(f'heads.{i}')
+    # if 'lm_head' in lora_module_names: # needed for 16-bit
+    #     lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
 
@@ -858,7 +868,11 @@ def train():
                 predictions = []
                 for i in range(len(metrics.predictions)):
                     logit = metrics.predictions[i]
+                    print('logit', logit)
+                    print(logit.shape)
                     label = metrics.label_ids[i] #just to see positions where prompt tokens are at
+                    print('label', label)
+                    print(label.shape)
                     logit_abcd = logit[label != IGNORE_INDEX]
                     toks = np.argmax(logit_abcd, axis=1)
                     predictions.append(
