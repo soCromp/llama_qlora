@@ -100,7 +100,7 @@ class ModelArguments:
     #     default=False,
     #     metadata={"help": "Enables using Huggingface auth token from Git Credentials."}
     # )
-    multihead: Optional[int] = field(
+    num_heads: Optional[int] = field(
         default=1,
         metadata={'help': 'Number of heads (>=1) to put on the model. 1 results in normal model, more constructs multiheaded model.'}
     )
@@ -326,6 +326,7 @@ def get_accelerate_model(args, checkpoint_dir):
 
     if torch.cuda.is_available():
         n_gpus = torch.cuda.device_count()
+    else: n_gpus = 0
     if is_ipex_available() and torch.xpu.is_available():
         n_gpus = torch.xpu.device_count()
         
@@ -341,22 +342,21 @@ def get_accelerate_model(args, checkpoint_dir):
 
 
     if args.full_finetune: assert args.bits in [16, 32]
-    assert args.multihead >= 1
+    assert args.num_heads >= 1
 
     print(f'loading base model {args.model_name_or_path}...')
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
     
     model = None
-    if args.multihead > 1:
-        # config = MHLlamaConfig(**vars(args))
-        # model = MultiheadLlamaForCausalLM(args.multihead, config)
+    if args.num_heads > 1:
+        config = MHLlamaConfig(**vars(args))
+        # model = num_headsLlamaForCausalLM(args.num_heads, config)
         transformers.AutoConfig.register('mhllama', MHLlamaConfig)
         transformers.AutoModelForCausalLM.register(MHLlamaConfig, MultiheadLlamaForCausalLM)
         model = AutoModelForCausalLM.from_pretrained(
-            '/home/sonia/llama-qlora/mhllama',
+            args.model_name_or_path,
+            config = config,
             cache_dir=args.cache_dir,
-            # load_in_4bit=args.bits == 4,
-            # load_in_8bit=args.bits == 8,
             device_map=device_map,
             max_memory=max_memory,
             quantization_config=BitsAndBytesConfig(
@@ -370,12 +370,11 @@ def get_accelerate_model(args, checkpoint_dir):
             ),
             torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
         )
+        print('MH llama has', model.num_heads, 'heads')
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
             cache_dir=args.cache_dir,
-            # load_in_4bit=args.bits == 4,
-            # load_in_8bit=args.bits == 8,
             device_map=device_map,
             max_memory=max_memory,
             quantization_config=BitsAndBytesConfig(
@@ -409,8 +408,11 @@ def get_accelerate_model(args, checkpoint_dir):
     model.config.torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
 
     # Tokenizer
+    tok_path = args.model_name_or_path
+    if args.num_heads > 1:
+        tok_path = '/mnt/data/zoo/llama2/llama2-7b-hf/'
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path,
+        tok_path,
         cache_dir=args.cache_dir,
         padding_side="right",
         use_fast=False, # Fast tokenizer giving issues.
@@ -779,7 +781,7 @@ def train():
 
     data_module = make_data_module(tokenizer=tokenizer, args=args)
     
-    if args.multihead > 1:
+    if args.num_heads > 1:
         do_mlm_sample=True # controls whether to do multihead-style sampling, will be passed as generation arg
     
     if args.diversity:

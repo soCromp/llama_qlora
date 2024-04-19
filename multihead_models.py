@@ -84,6 +84,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         self.heads = nn.ModuleList(headlist)
         
         self.post_init() # Initialize weights and apply final processing
+        self.trace = False # for debugging
         
 
     def get_input_embeddings(self):
@@ -105,17 +106,27 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         return self.model
     
     
-    def get_heads_logits(self, hidden_states, cloze_indices):
+    def get_heads_logits(self, hidden_states, cloze_indices, return_individual_preds=False):
+        """return_individual_preds is if you want to see what is output by each individual head"""
+        print('cloze indices', cloze_indices, )
+        print('shape', cloze_indices.shape)
         headout = torch.zeros(hidden_states.shape[0], hidden_states.shape[1], self.config.vocab_size, 
                               dtype=hidden_states.dtype, device=hidden_states.device)
         cloze_guesses = torch.zeros(hidden_states.shape[0], cloze_indices.shape[0], self.config.vocab_size, 
                                 dtype=hidden_states.dtype, device=hidden_states.device)
+        
+        preds = []
+        
         for i in range(self.num_heads):
             pred = self.heads[i](hidden_states)
+            preds.append(pred)
             headout += pred / torch.as_tensor(self.num_heads, device=pred.device)
             cloze_guesses[:, i, :] = pred[:, -1, :]
         headout[:, cloze_indices, :] = cloze_guesses
-        return headout
+        if return_individual_preds:
+            return headout, preds
+        else: 
+            return headout
     
     
     def forward(
@@ -134,6 +145,9 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         r"""
         Copied from LlamaForCausalLM forward()
         ```"""
+        if self.trace: 
+            print('in forward')
+            print(input_ids, attention_mask, labels)
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -160,8 +174,8 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         if self.config.pretraining_tp > 1:
             return ValueError('unsupported hyperparameter pretraining tp > 1')
         else:
-            locs_batch, locs_tok = torch.where(input_ids==3695) #special mask token ~
-            logits = self.get_heads_logits(hidden_states, locs_tok[locs_batch==0]+1)
+            locs_tok = torch.where(input_ids[0]==3695)[0] #special mask token ~
+            logits = self.get_heads_logits(hidden_states, locs_tok)
             
 
         logits = logits.float() # logits are batch_size x tokens x 32000 (vocab size)
@@ -187,12 +201,15 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            hidden_states=hidden_states, #outputs.hidden_states,
             attentions=outputs.attentions,
         )
         
         
     def can_generate(self): return True
+    
+    def set_trace(self, value):
+        self.trace = value
     
     
     @torch.no_grad()
@@ -284,6 +301,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                     - [`~generation.BeamSearchEncoderDecoderOutput`],
                     - [`~generation.BeamSampleEncoderDecoderOutput`]
         """
+        if self.trace: print('in generate')
 
         if synced_gpus is None:
             if is_deepspeed_zero3_enabled() and dist.get_world_size() > 1:
@@ -537,6 +555,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                 `return_dict_in_generate=True` or a [`~generation.GreedySearchEncoderDecoderOutput`] if
                 `model.config.is_encoder_decoder=True`.
             ```"""
+        if self.trace: print('in mlm_sample')
         # from beam search. init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
@@ -637,13 +656,12 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         hidden_states = outputs[0] # batch_size x tokens x 4096
         # print('hidden states', hidden_states.shape)
         
-        locs_batch, locs_tok = torch.where(input_ids==3695) #special mask token ~
-        result = copy.deepcopy(input_ids)
-                
-        logits = self.get_heads_logits(hidden_states, locs_tok[locs_batch==0]+1)
+        locs_tok = torch.where(input_ids[0]==3695)[0] #special mask token ~
+        print('input_ids', input_ids)
+        logits = self.get_heads_logits(hidden_states, locs_tok)
                 
         # pre-process distribution
-        next_tokens_scores = logits_processor(input_ids[:, :j.item()], logits)
+        next_tokens_scores = logits_processor(input_ids, logits) #[:, :j.item()]
         
         # Store scores, attentions and hidden_states when required
         if return_dict_in_generate and output_scores:

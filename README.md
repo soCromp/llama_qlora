@@ -33,7 +33,7 @@ if dtype == torch.bfloat16:
 ```
 
 **Second**: 
-Change `transformers/modeling_utils.py` line 1089 to `param.numel() * 2 * torch.tensor(1, dtype=self.hf_quantizer.quantization_config.bnb_4bit_quant_storage).element_size()`.
+Change `transformers/modeling_utils.py` line 1164 to `nb_params = torch.tensor(1, dtype=self.hf_quantizer.quantization_config.bnb_4bit_quant_storage).element_size()`.
 
 ## Model registration
 
