@@ -81,6 +81,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.num_heads = config.num_heads
+        self.mh_config = config
         
         headlist = []
         # self.heads = nn.ModuleList()
@@ -112,8 +113,10 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         return self.model
     
     
-    def get_heads_logits(self, hidden_states, cloze_indices, return_individual_preds=False):
+    def get_heads_logits(self, hidden_states, input_ids, len_input, return_individual_preds=False):
         """return_individual_preds is if you want to see what is output by each individual head"""
+        cloze_indices = torch.where(input_ids[0]==3695)[0] #special mask token ~
+        
         headout = torch.zeros(hidden_states.shape[0], hidden_states.shape[1], self.config.vocab_size, 
                               dtype=hidden_states.dtype, device=hidden_states.device)
         cloze_guesses = torch.zeros(hidden_states.shape[0], cloze_indices.shape[0], self.config.vocab_size, 
@@ -130,7 +133,39 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         # if return_individual_preds:
         #     return headout, preds
         # else: 
-        return headout
+        
+        if self.mh_config.head_assembly == 'follow' and self.mh_config.head_loss == 'rearrange':
+            return headout
+        
+        if self.mh_config.head_assembly == 'follow' and self.mh_config.head_loss == 'pull':#2
+            preds = []
+            for i in range(self.num_heads):
+                pred = self.heads[i](hidden_states)
+                preds.append(pred[len_input+1:])
+            headout = torch.stack(preds)
+            return headout
+        
+        elif self.mh_config.head_assembly == 'just' and self.mh_config.head_loss == 'rearrange':
+            return ValueError('Cannot combine "just" head_assembly with "rearrange" head_loss')
+        
+        elif self.mh_config.head_assembly == 'just' and self.mh_config.head_loss == 'pull':#1
+            preds = []
+            for i in range(self.num_heads):
+                pred = self.heads[i](hidden_states)
+                preds.append(pred)
+            headout = torch.stack(preds)
+            return headout
+        
+        elif self.mh_config.head_assembly == 'correct' and self.mh_config.head_loss == 'rearrange':
+            headout = torch.zeros(hidden_states.shape[0], hidden_states.shape[1], self.config.vocab_size, 
+                              dtype=hidden_states.dtype, device=hidden_states.device)
+            return headout
+        
+        elif self.mh_config.head_assembly == 'correct' and self.mh_config.head_loss == 'pull': #3
+            return headout
+        
+        else:
+            return ValueError(f'incorrect head_assembly argument {self.mh_config.head_assembly} or head_loss argument {self.mh_config.head_loss}')
     
     
     def forward(
@@ -178,8 +213,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         if self.config.pretraining_tp > 1:
             return ValueError('unsupported hyperparameter pretraining tp > 1')
         else:
-            locs_tok = torch.where(input_ids[0]==3695)[0] #special mask token ~
-            logits = self.get_heads_logits(hidden_states, locs_tok)
+            logits = self.get_heads_logits(hidden_states, input_ids, (labels==IGNORE_INDEX).sum())
             
 
         logits = logits.float() # logits are batch_size x tokens x 32000 (vocab size)
@@ -660,9 +694,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         hidden_states = outputs[0] # batch_size x tokens x 4096
         # print('hidden states', hidden_states.shape)
         
-        locs_tok = torch.where(input_ids[0]==3695)[0] #special mask token ~
-        print('input_ids', input_ids)
-        logits = self.get_heads_logits(hidden_states, locs_tok)
+        logits = self.get_heads_logits(hidden_states, input_ids, (labels==IGNORE_INDEX).sum())
                 
         # pre-process distribution
         next_tokens_scores = logits_processor(input_ids, logits) #[:, :j.item()]
