@@ -555,7 +555,6 @@ class DataCollatorForMHLM:
         
         targets = self.tokenizer(instances.values.reshape((1,-1))[0].tolist(),  # (num_cols*batch_size,) ndarray row1col1 row1col2 ... row2col1 row2col2 etc
                                  add_special_tokens=False, padding=True, return_tensors='pt')
-        print('targets', targets['input_ids'].shape)
         # batch_size*num_cols x longest_tokens,  pads tokens with 0s
         
         # batch_size x num_cols x longest_tokens:
@@ -565,28 +564,33 @@ class DataCollatorForMHLM:
         print('targets_tok', targets_tok.shape)
     
         blanks = torch.full(targets_tok.shape, self.tokenizer.pad_token_id) #also bs x num_col x tokens
-        chunkcols = [] 
+        input_ids_list = []
+        labels_list = [] 
         for i in range(self.num_cols):
             stretch_chunk = self.prompt_ids[i].repeat(batch_size, 1) # bs x tokens
-            chunkcols.extend([stretch_chunk, blanks[:, i, :]])
-            # chunkcol = torch.cat((stretch_chunk, blanks[:, i, :]), dim=1) # bs x (chunk_tokens + blanks_tokens)
-            # chunkcols.append(chunkcol)
-        chunkcols.append(self.prompt_ids[-1].repeat(batch_size, 1))
-        input_ids = torch.cat(chunkcols, dim=1).int() # bs x (prompt_length + targets'_tokens_length)
-        print('prompt_ids', [c.shape for c in self.prompt_ids])
+            input_ids_list.extend([stretch_chunk, blanks[:, i, :]])
+            labels_list.extend([stretch_chunk, targets_tok[:,i,:]])
+        stretch_chunk = self.prompt_ids[-1].repeat(batch_size, 1)
+        input_ids_list.append(stretch_chunk)
+        labels_list.append(stretch_chunk)
+        input_ids = torch.cat(input_ids_list, dim=1).long() # bs x (prompt_length + targets'_tokens_length)
+        labels = torch.cat(labels_list, dim=1).long()
+        # print('prompt_ids', [c.shape for c in self.prompt_ids])
         print('input_ids', input_ids.shape, input_ids)
+        print('labels   ', labels.shape, labels)
         
         # start of the pad tokens where model predictions should get inserted:
         insert_indices = torch.empty((self.num_cols+1), dtype=torch.int)
         insert_indices[0] = -1 # for convenience of indexing inside the model
         insert_indices[1:] = torch.where(input_ids[0] == self.tokenizer.pad_token_id)[0][::targets_tok.shape[2]]
         #                      since ea ex the same^           input_ids==0                        pad tokens per column
-        print(insert_indices)
+        # print(insert_indices)
         
         data_dict = {
             'input_ids': input_ids,
             'attention_mask':input_ids.ne(self.tokenizer.pad_token_id),
-            'labels': targets_tok,
+            # 'targets': targets_tok,
+            'labels': labels,
             'insert_indices': insert_indices
         }
         return data_dict

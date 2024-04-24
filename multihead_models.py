@@ -119,12 +119,12 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         """return_individual_preds is if you want to see what is output by each individual head"""
         preds = []
         for i in range(self.num_heads):
-            print('\t', i, insert_indices[i]+1, insert_indices[i+1])
+            # print('\t', i, insert_indices[i]+1, insert_indices[i+1])
             pred = self.heads[i](hidden_states) # batch_size x tokens x vocab_size
             preds.extend((pred[:, insert_indices[i]+1:insert_indices[i+1], :], pred[:, -1:, :]))
         preds.append(pred[:, insert_indices[-1]+1:, :]) # just to get the last col_token marker after the last head, plus a filler token at very end
-        print('input ids shape', input_ids.shape)
-        print('shapes in preds', [p.shape for p in preds])
+        # print('input ids shape', input_ids.shape)
+        # print('shapes in preds', [p.shape for p in preds])
         print('assembled preds', torch.cat(preds, dim=1).shape)
         return torch.cat(preds, dim=1) # batch_size x tokens x vocab_size
     
@@ -201,15 +201,18 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
 
         loss = None
         if labels is not None:
+            print('logits', logits.shape, 'labels', labels.shape)
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            print('logits', shift_logits.shape, 'labels', shift_labels.shape)
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
+            print('logits', shift_logits.shape, 'labels', shift_labels.shape)
             loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
