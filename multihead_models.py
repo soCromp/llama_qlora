@@ -115,69 +115,28 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         return self.model
     
     
-    def get_heads_logits(self, hidden_states, input_ids, len_input, return_individual_preds=False):
+    def get_heads_logits(self, hidden_states, input_ids, insert_indices, return_individual_preds=False):
         """return_individual_preds is if you want to see what is output by each individual head"""
-        cloze_indices = torch.where(input_ids[0]==3695)[0] #special mask token ~
-        
-        headout = torch.zeros(hidden_states.shape[0], hidden_states.shape[1], self.config.vocab_size, 
-                              dtype=hidden_states.dtype, device=hidden_states.device)
-        cloze_guesses = torch.zeros(hidden_states.shape[0], cloze_indices.shape[0], self.config.vocab_size, 
-                                dtype=hidden_states.dtype, device=hidden_states.device)
-        
         preds = []
-        
         for i in range(self.num_heads):
-            pred = self.heads[i](hidden_states)
-            preds.append(pred)
-            headout += pred / torch.as_tensor(self.num_heads, device=pred.device)
-            cloze_guesses[:, i, :] = pred[:, -1, :]
-        headout[:, cloze_indices, :] = cloze_guesses
-        # if return_individual_preds:
-        #     return headout, preds
-        # else: 
-        
-        if self.mh_config.head_assembly == 'follow' and self.mh_config.head_loss == 'rearrange':
-            return headout
-        
-        if self.mh_config.head_assembly == 'follow' and self.mh_config.head_loss == 'pull':#2
-            preds = []
-            for i in range(self.num_heads):
-                pred = self.heads[i](hidden_states)
-                preds.append(pred[len_input+1:])
-            headout = torch.stack(preds)
-            return headout
-        
-        elif self.mh_config.head_assembly == 'just' and self.mh_config.head_loss == 'rearrange':
-            return ValueError('Cannot combine "just" head_assembly with "rearrange" head_loss')
-        
-        elif self.mh_config.head_assembly == 'just' and self.mh_config.head_loss == 'pull':#1
-            preds = []
-            for i in range(self.num_heads):
-                pred = self.heads[i](hidden_states)
-                preds.append(pred)
-            headout = torch.stack(preds)
-            return headout
-        
-        elif self.mh_config.head_assembly == 'correct' and self.mh_config.head_loss == 'rearrange':
-            headout = torch.zeros(hidden_states.shape[0], hidden_states.shape[1], self.config.vocab_size, 
-                              dtype=hidden_states.dtype, device=hidden_states.device)
-            return headout
-        
-        elif self.mh_config.head_assembly == 'correct' and self.mh_config.head_loss == 'pull': #3
-            return headout
-        
-        else:
-            return ValueError(f'incorrect head_assembly argument {self.mh_config.head_assembly} or head_loss argument {self.mh_config.head_loss}')
+            print('\t', i, insert_indices[i]+1, insert_indices[i+1])
+            pred = self.heads[i](hidden_states) # batch_size x tokens x vocab_size
+            preds.extend((pred[:, insert_indices[i]+1:insert_indices[i+1], :], pred[:, -1:, :]))
+        preds.append(pred[:, insert_indices[-1]+1:, :]) # just to get the last col_token marker after the last head, plus a filler token at very end
+        print('input ids shape', input_ids.shape)
+        print('shapes in preds', [p.shape for p in preds])
+        print('assembled preds', torch.cat(preds, dim=1).shape)
+        return torch.cat(preds, dim=1) # batch_size x tokens x vocab_size
     
     
-    def insert_cols_to_prompt(prompt, cols):
+    def insert_cols_to_prompt(self, prompt, cols):
         """prompt: 1 x tokensp tensor
             cols: batch_size x num_cols x tokensc tensor
             returns sents: a batch_size x tokensp+num_cols*tokensc tensor, with cols inserted at cls_token locations"""
         batch_size = cols.shape[0]
-        indices = torch.where(prompt==self.mh_config.col_token_id) + 1 #so col_token_id will be at end of each split, not the start
+        indices = torch.where(prompt==self.mh_config.col_token_id)[0] + 1 #so col_token_id will be at end of each split, not the start
         # tuple with num_cols elements. i-th element is prompt between (i-1)th and ith head, plus i-th col token:
-        splits = torch.tensor_split(prompt, indices) 
+        splits = torch.tensor_split(prompt, indices.cpu()) 
         splitscols = []
         for i, split in enumerate(splits):
             splitm = split.repeat(batch_size, 1) #batch_size x tokens
@@ -190,6 +149,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        insert_indices: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -201,7 +161,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
-        Copied from LlamaForCausalLM forward()
+        Modified from LlamaForCausalLM forward()
         ```"""
         if self.trace: 
             print('in forward')
@@ -213,8 +173,8 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        blanks = torch.ones_like(labels) # batch_size x num_cols x targets_len tensor
-        inputs = insert_cols_to_prompt(input_ids, blanks) #batch_size x total_tokens
+        # blanks = torch.ones_like(labels) # batch_size x num_cols x targets_len tensor
+        # inputs = self.insert_cols_to_prompt(input_ids, blanks) #batch_size x total_tokens
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -235,7 +195,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         if self.config.pretraining_tp > 1:
             return ValueError('unsupported hyperparameter pretraining tp > 1')
         else:
-            logits = self.get_heads_logits(hidden_states, input_ids, (labels==IGNORE_INDEX).sum())
+            logits = self.get_heads_logits(hidden_states, input_ids, insert_indices)
             
         logits = logits.float() # logits are batch_size x tokens x 32000 (vocab size)
 
@@ -965,7 +925,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         hidden_states = outputs[0] # batch_size x tokens x 4096
         # print('hidden states', hidden_states.shape)
         
-        logits = self.get_heads_logits(hidden_states, input_ids, (labels==IGNORE_INDEX).sum())
+        logits = self.get_heads_logits(hidden_states, input_ids)
                 
         # pre-process distribution
         next_tokens_scores = logits_processor(input_ids, logits) #[:, :j.item()]

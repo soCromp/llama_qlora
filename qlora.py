@@ -547,36 +547,47 @@ class DataCollatorForMHLM:
         
     
     def __call__(self, instances: Sequence[Dict]) -> Dict:
+        # instances = instances[0]
+        instances= pd.DataFrame(instances)
         # Extract elements
-        batch_size = len(instances['length'])
-        instances.pop('length')
+        batch_size = len(instances)
+        instances = instances.drop('length', axis=1)
         
-        # will be one list of batch_size*num_cols elements: row1col1 row2col1 ... row1col2 row2col2 etc:
-        targets_text_list = sum(instances.values(), [])
-        targets = self.tokenizer(targets_text_list, 
+        targets = self.tokenizer(instances.values.reshape((1,-1))[0].tolist(),  # (num_cols*batch_size,) ndarray row1col1 row1col2 ... row2col1 row2col2 etc
                                  add_special_tokens=False, padding=True, return_tensors='pt')
-        # pads with 0s
+        print('targets', targets['input_ids'].shape)
+        # batch_size*num_cols x longest_tokens,  pads tokens with 0s
         
-        # this code sucks but I promise there was no more succinct way of doing it
-        targets_len = targets['input_ids'].shape[1]
-        targets_tok = targets['input_ids'].unsqueeze(1) # batch_size*num_cols x 1 x targets_len
-        targets_tok = torch.split(targets_tok, batch_size) # num_cols-element tuple of batch_size x targets_len tensors
-        targets_tok = torch.cat(targets_tok, dim=1) #batch_size x num_cols x targets_len tensor
+        # batch_size x num_cols x longest_tokens:
+        targets_tok = targets['input_ids'].reshape((batch_size, self.num_cols, targets['input_ids'].shape[-1])) 
+        # add extra pad token at end so all have padding
         targets_tok = torch.cat((targets_tok, torch.full((batch_size, self.num_cols, 1), self.tokenizer.pad_token_id)), dim=2)
-        
-        blanks = torch.full(targets_tok.shape, self.tokenizer.pad_token_id)
-        chunkcols = []
+        print('targets_tok', targets_tok.shape)
+    
+        blanks = torch.full(targets_tok.shape, self.tokenizer.pad_token_id) #also bs x num_col x tokens
+        chunkcols = [] 
         for i in range(self.num_cols):
-            stretch_chunk = self.prompt_ids[i].repeat(batch_size, 1)
-            chunkcol = torch.cat((stretch_chunk, blanks[:, i, :]), dim=1)
-            chunkcols.append(chunkcol)
+            stretch_chunk = self.prompt_ids[i].repeat(batch_size, 1) # bs x tokens
+            chunkcols.extend([stretch_chunk, blanks[:, i, :]])
+            # chunkcol = torch.cat((stretch_chunk, blanks[:, i, :]), dim=1) # bs x (chunk_tokens + blanks_tokens)
+            # chunkcols.append(chunkcol)
         chunkcols.append(self.prompt_ids[-1].repeat(batch_size, 1))
-        input_ids = torch.cat(chunkcols, dim=1).int()
+        input_ids = torch.cat(chunkcols, dim=1).int() # bs x (prompt_length + targets'_tokens_length)
+        print('prompt_ids', [c.shape for c in self.prompt_ids])
+        print('input_ids', input_ids.shape, input_ids)
+        
+        # start of the pad tokens where model predictions should get inserted:
+        insert_indices = torch.empty((self.num_cols+1), dtype=torch.int)
+        insert_indices[0] = -1 # for convenience of indexing inside the model
+        insert_indices[1:] = torch.where(input_ids[0] == self.tokenizer.pad_token_id)[0][::targets_tok.shape[2]]
+        #                      since ea ex the same^           input_ids==0                        pad tokens per column
+        print(insert_indices)
         
         data_dict = {
             'input_ids': input_ids,
             'attention_mask':input_ids.ne(self.tokenizer.pad_token_id),
             'labels': targets_tok,
+            'insert_indices': insert_indices
         }
         return data_dict
     
