@@ -1,8 +1,10 @@
 python qlora.py \
     --model_name_or_path /home/sonia/llama-qlora/mhllama \
     --num_heads 4 \
+    --head_assembly follow \
+    --head_loss rearrange \
     --use_auth \
-    --output_dir /mnt/data/sonia/ckpts/cloze \
+    --output_dir /mnt/data/sonia/ckpts/clozehead \
     --logging_steps 10 \
     --save_strategy steps \
     --data_seed 42 \

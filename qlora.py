@@ -8,7 +8,7 @@ import os
 from os.path import exists, join, isdir
 from dataclasses import dataclass, field
 import sys
-from typing import Optional, Dict, Sequence
+from typing import Optional, Dict, Sequence, List
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -36,7 +36,7 @@ from transformers import (
     LlamaConfig
 
 )
-from datasets import load_dataset, Dataset, load_from_disk
+from datasets import load_dataset, Dataset, load_from_disk, DatasetDict
 import evaluate
 
 from peft import (
@@ -142,8 +142,8 @@ class DataArguments:
         metadata={"help": "Which dataset to finetune on. See datamodule for options."}
     )
     dataset_format: Optional[str] = field(
-        default="inout",
-        metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf|inout]"}
+        default="mlm",
+        metadata={"help": "Which dataset format is used. [mlm|inout]"}
     )
 
 @dataclass
@@ -448,6 +448,7 @@ def get_accelerate_model(args, checkpoint_dir):
                 "unk_token": tokenizer.convert_ids_to_tokens(
                     model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
                 ),
+                "cls_token": tokenizer.convert_ids_to_tokens(model.config.col_token_id)
         })
     
     if not args.full_finetune:
@@ -523,6 +524,63 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings_data[-num_new_tokens:] = input_embeddings_avg
         output_embeddings_data[-num_new_tokens:] = output_embeddings_avg
 
+
+@dataclass
+class DataCollatorForMHLM:
+    
+    def __init__(self, tokenizer, source_max_len, target_max_len, train_on_source, predict_with_generate, prompt):
+        self.tokenizer = tokenizer
+        self.source_max_len = source_max_len
+        self.target_max_len = target_max_len
+        self.predict_with_generate = predict_with_generate
+        
+        self.num_cols = len(prompt)-1
+        for i in range(1, len(prompt)):
+            prompt[i] = f'{self.tokenizer.cls_token}' + prompt[i]
+        print(prompt)
+        self.prompt_ids, _ = self.tokenizer(prompt,
+            add_special_tokens=False).values() 
+        self.prompt_ids = [torch.as_tensor(chunk) for chunk in self.prompt_ids] # removes EOS tokens, make into tensors
+        self.prompt_ids = [chunk[chunk!=29871] for chunk in self.prompt_ids]
+        print(self.prompt_ids)
+        self.col_tok = self.tokenizer(f'{self.tokenizer.cls_token}', add_special_tokens=False)['input_ids'][0] #3
+        
+    
+    def __call__(self, instances: Sequence[Dict]) -> Dict:
+        # Extract elements
+        batch_size = len(instances['length'])
+        instances.pop('length')
+        
+        # will be one list of batch_size*num_cols elements: row1col1 row2col1 ... row1col2 row2col2 etc:
+        targets_text_list = sum(instances.values(), [])
+        targets = self.tokenizer(targets_text_list, 
+                                 add_special_tokens=False, padding=True, return_tensors='pt')
+        # pads with 0s
+        
+        # this code sucks but I promise there was no more succinct way of doing it
+        targets_len = targets['input_ids'].shape[1]
+        targets_tok = targets['input_ids'].unsqueeze(1) # batch_size*num_cols x 1 x targets_len
+        targets_tok = torch.split(targets_tok, batch_size) # num_cols-element tuple of batch_size x targets_len tensors
+        targets_tok = torch.cat(targets_tok, dim=1) #batch_size x num_cols x targets_len tensor
+        targets_tok = torch.cat((targets_tok, torch.full((batch_size, self.num_cols, 1), self.tokenizer.pad_token_id)), dim=2)
+        
+        blanks = torch.full(targets_tok.shape, self.tokenizer.pad_token_id)
+        chunkcols = []
+        for i in range(self.num_cols):
+            stretch_chunk = self.prompt_ids[i].repeat(batch_size, 1)
+            chunkcol = torch.cat((stretch_chunk, blanks[:, i, :]), dim=1)
+            chunkcols.append(chunkcol)
+        chunkcols.append(self.prompt_ids[-1].repeat(batch_size, 1))
+        input_ids = torch.cat(chunkcols, dim=1).int()
+        
+        data_dict = {
+            'input_ids': input_ids,
+            'attention_mask':input_ids.ne(self.tokenizer.pad_token_id),
+            'labels': targets_tok,
+        }
+        return data_dict
+    
+
 @dataclass
 class DataCollatorForCausalLM(object):
     tokenizer: transformers.PreTrainedTokenizer
@@ -555,9 +613,9 @@ class DataCollatorForCausalLM(object):
             tokenized_sources_with_prompt['input_ids'],
             tokenized_targets['input_ids']
         ):
-            if not self.predict_with_generate:
+            if not self.predict_with_generate: # always here
                 input_ids.append(torch.tensor(tokenized_source + tokenized_target))
-                if not self.train_on_source:
+                if not self.train_on_source: #always here
                     labels.append(
                         torch.tensor([IGNORE_INDEX for _ in range(len(tokenized_source))] + copy.deepcopy(tokenized_target))
                     )
@@ -621,7 +679,14 @@ def local_dataset(dataset_name):
     elif dataset_name.endswith('.tsv'):
         full_dataset = Dataset.from_pandas(pd.read_csv(dataset_name, delimiter='\t'))
     elif dataset_name.endswith('.dat'):
-        full_dataset = load_from_disk(dataset_name)
+        if 'dataset_dict.json' in os.listdir(dataset_name):
+            full_dataset = DatasetDict({})
+            for f in os.listdir(dataset_name):
+                if f.endswith('.json'): continue
+                full_dataset[f] = load_from_disk(os.path.join(dataset_name, f))
+            return full_dataset
+        else:
+            full_dataset = load_from_disk(dataset_name)
     else:
         raise ValueError(f"Unsupported dataset format: {dataset_name}")
 
@@ -632,85 +697,24 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     """
     Make dataset and collator for supervised fine-tuning.
     Datasets are expected to have the following columns: { `input`, `output` }
-
-    Available datasets to be selected with `dataset` argument:
-        - alpaca, 52002 examples
-        - alpaca cleaned, 51942 examples
-        - chip2 (OIG), 210289 examples
-        - self-instruct, 82612 examples
-        - hh-rlhf (Anthropic), 160800 examples
-        - longform, 23.7k examples
-        - oasst1 (OpenAssistant) primary message tree only, 9,846 examples
-
-    Coming soon:
-        - unnatural instructions core, 66010 examples
-        - unnatural instructions full, 240670 examples
-        - alpaca-gpt4, 52002 examples
-        - unnatural-instructions-gpt4, 9000 examples
-        - supernatural-instructions, 69624 examples (same as paper with 100 ex/task more can be used)
-        - flan (FLAN v2), up to 20M examples available
-        - vicuna
-
     """
     def load_data(dataset_name):
-        if dataset_name == 'alpaca':
-            return load_dataset("tatsu-lab/alpaca")
-        elif dataset_name == 'alpaca-clean':
-            return load_dataset("yahma/alpaca-cleaned")
-        elif dataset_name == 'chip2':
-            return load_dataset("laion/OIG", data_files='unified_chip2.jsonl')
-        elif dataset_name == 'self-instruct':
-            return load_dataset("yizhongw/self_instruct", name='self_instruct')
-        elif dataset_name == 'hh-rlhf':
-            return load_dataset("Anthropic/hh-rlhf")
-        elif dataset_name == 'longform':
-            return load_dataset("akoksal/LongForm")
-        elif dataset_name == 'oasst1':
-            return load_dataset("timdettmers/openassistant-guanaco")
-        elif dataset_name == 'wikide':
-            dataset = load_dataset('wikimedia/wikipedia', '20231101.de')
-            dataset = dataset.rename_column('title', 'input')
-            dataset = dataset.rename_column('text', 'output')
-            return dataset
-        elif dataset_name == 'vicuna':
-            raise NotImplementedError("Vicuna data was not released.")
-        elif os.path.exists(dataset_name):
-            # args.dataset_format is  "inout" by default
+        # if dataset_name == 'alpaca':
+        #     return load_dataset("tatsu-lab/alpaca")
+        if os.path.exists(dataset_name):
             return local_dataset(dataset_name)
         else:
             raise NotImplementedError(f"Dataset {dataset_name} not implemented yet.")
 
     def format_dataset(dataset, dataset_format):
-        if (
-            dataset_format == 'alpaca' or dataset_format == 'alpaca-clean' or
-            (dataset_format is None and args.dataset in ['alpaca', 'alpaca-clean'])
-        ):
-            dataset = dataset.map(extract_alpaca_dataset, remove_columns=['instruction'])
-        elif dataset_format == 'chip2' or (dataset_format is None and args.dataset == 'chip2'):
-            dataset = dataset.map(lambda x: {
-                'input': x['text'].split('\n<bot>: ')[0].replace('<human>: ', ''),
-                'output': x['text'].split('\n<bot>: ')[1],
-            })
-        elif dataset_format == 'self-instruct' or (dataset_format is None and args.dataset == 'self-instruct'):
-            for old, new in [["prompt", "input"], ["completion", "output"]]:
-                dataset = dataset.rename_column(old, new)
-        elif dataset_format == 'hh-rlhf' or (dataset_format is None and args.dataset == 'hh-rlhf'):
-            dataset = dataset.map(lambda x: {
-                'input': '',
-                'output': x['chosen']
-            })
-        elif dataset_format == 'oasst1' or (dataset_format is None and args.dataset == 'oasst1'):
-            dataset = dataset.map(lambda x: {
-                'input': '',
-                'output': x['text'],
-            })
-        elif dataset_format == 'inout': #input and output columns
-            # leave as is
+        if dataset_format == 'inout': #input and output columns
+            # Remove unused columns.
+            dataset = dataset.remove_columns(
+                [col for col in dataset.column_names['train'] if col not in ['input', 'output']]
+            )
+        elif dataset_format == 'mlm':
+            # find relevant columns and remove others
             pass
-        # Remove unused columns.
-        dataset = dataset.remove_columns(
-            [col for col in dataset.column_names['train'] if col not in ['input', 'output']]
-        )
         return dataset
 
      # Load dataset.
@@ -729,23 +733,22 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             eval_dataset = dataset['test']
         if args.max_eval_samples is not None and args.eval_dataset_size>0 and len(eval_dataset) > args.max_eval_samples:
             eval_dataset = eval_dataset.select(range(args.max_eval_samples))
-        if args.group_by_length and args.eval_dataset_size>0:
-            eval_dataset = eval_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
-        if args.eval_dataset_size==0: 
-            eval_dataset=[0]
+        # if args.group_by_length and args.eval_dataset_size>0:
+        #     eval_dataset = eval_dataset.map(lambda x: {'length': sum([len(x[col] for col in x)])})
     if args.do_train:
         train_dataset = dataset['train']
         if args.max_train_samples is not None and len(train_dataset) > args.max_train_samples:
             train_dataset = train_dataset.select(range(args.max_train_samples))
-        if args.group_by_length:
-            train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
+        # if args.group_by_length:
+        #     train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
 
-    data_collator = DataCollatorForCausalLM(
+    data_collator = DataCollatorForMHLM(
         tokenizer=tokenizer,
         source_max_len=args.source_max_len,
         target_max_len=args.target_max_len,
         train_on_source=args.train_on_source,
         predict_with_generate=args.predict_with_generate,
+        prompt = dataset['prompt']['prompt'],
     )
     return dict(
         train_dataset=train_dataset if args.do_train else None,
