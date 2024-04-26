@@ -26,7 +26,7 @@ class MHLlamaConfig(LlamaConfig):
     
     def __init__(
             self,
-            num_heads=1,
+            num_heads=4,
             head_assembly='follow',
             head_loss='rearrange',
             vocab_size=32000,
@@ -75,7 +75,10 @@ class MHLlamaConfig(LlamaConfig):
 
 class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
     config_class = MHLlamaConfig
-    _tied_weights_keys = []
+    _tied_weights_keys = ["heads.0.weight"]
+    _tied_weights_keys = ["heads.1.weight"]
+    _tied_weights_keys = ["heads.2.weight"]
+    _tied_weights_keys = ["heads.3.weight"]
     
     def __init__(self, config):
         super().__init__(config) #['llamamodel_config']
@@ -121,7 +124,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         preds = []
         for i in range(self.num_heads):
             # print('\t', i, insert_indices[i]+1, insert_indices[i+1])
-            pred = self.heads[i](hidden_states) # batch_size x tokens x vocab_size
+            pred = self.heads[i](hidden_states.float()) # batch_size x tokens x vocab_size
             preds.extend((pred[:, insert_indices[i]+1:insert_indices[i+1], :], pred[:, -1:, :]))
         preds.append(pred[:, insert_indices[-1]+1:, :]) # just to get the last col_token marker after the last head, plus a filler token at very end
         # print('input ids shape', input_ids.shape)
@@ -160,6 +163,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Modified from LlamaForCausalLM forward()
@@ -189,6 +193,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
         )
 
         hidden_states = outputs[0] # batch_size x tokens x 4096
@@ -439,7 +444,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
 
         # if streamer is not None:
         #     streamer.put(input_ids.cpu())
-        input_ids = input_ids.cuda()
+        input_ids.to(self.device)
 
         # 6. Prepare `max_length` depending on other stopping criteria.
         input_ids_seq_length = input_ids.shape[-1]
@@ -653,7 +658,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             if synced_gpus and this_peer_finished:
                 continue  # don't waste resources running the code we don't need
 
-            next_token_logits = outputs.logits[:, insert_indices, :] # batch_size x num_heads x vocab_size
+            next_token_logits = outputs.logits[:, insert_indices[1:], :] # batch_size x num_heads x vocab_size
 
             # pre-process distribution
             next_tokens_scores = logits_processor(input_ids, next_token_logits) # logits processor does nothing []
@@ -685,10 +690,11 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             if eos_token_id is not None:
                 if pad_token_id is None:
                     raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                print('next_tokens', next_tokens.shape, 'unfinished_cols', unfinished_cols.shape)
                 next_tokens = next_tokens * unfinished_cols + pad_token_id * (1 - unfinished_cols) # unfinished_cols==1 if col not previously had EOS
 
             # update generated ids, model inputs, and length for next step
-            input_ids[insert_indices] = next_tokens
+            input_ids[:, insert_indices[1:]] = next_tokens
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -817,7 +823,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         if has_static_cache:
             past_key_values = None
             
-        insert_indices += torch.arange(1, insert_indices.shape[0]) # since ea col has one more token added to it
+        insert_indices += torch.arange(0, insert_indices.shape[0]) # since ea col has one more token added to it
 
         model_inputs.update(
             {

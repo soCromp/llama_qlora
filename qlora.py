@@ -294,9 +294,9 @@ def find_all_linear_names(args, model):
         #     names = name.split('.')
         #     lora_module_names.add(names[-1])
     
-    if args.num_heads > 1:
-        for i in range(args.num_heads):
-            lora_module_names.add(f'heads.{i}')
+    # if args.num_heads > 1:
+    #     for i in range(args.num_heads):
+    #         lora_module_names.add(f'heads.{i}')
     # if 'lm_head' in lora_module_names: # needed for 16-bit
     #     lora_module_names.remove('lm_head')
     return list(lora_module_names)
