@@ -148,9 +148,6 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(transformers.Seq2SeqTrainingArguments):
-    cache_dir: Optional[str] = field(
-        default=None
-    )
     train_on_source: Optional[bool] = field(
         default=False,
         metadata={"help": "Whether to train on the input in addition to the target text."}
@@ -366,7 +363,7 @@ def get_accelerate_model(args, checkpoint_dir):
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
             config = config,
-            cache_dir=args.cache_dir,
+            # cache_dir=args.cache_dir,
             device_map=device_map,
             max_memory=max_memory,
             quantization_config=BitsAndBytesConfig(
@@ -384,7 +381,7 @@ def get_accelerate_model(args, checkpoint_dir):
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
-            cache_dir=args.cache_dir,
+            # cache_dir=args.cache_dir,
             device_map=device_map,
             max_memory=max_memory,
             quantization_config=BitsAndBytesConfig(
@@ -423,7 +420,7 @@ def get_accelerate_model(args, checkpoint_dir):
         tok_path = '/mnt/data/zoo/llama2/llama2-7b-hf/'
     tokenizer = AutoTokenizer.from_pretrained(
         tok_path,
-        cache_dir=args.cache_dir,
+        # cache_dir=args.cache_dir,
         padding_side="right",
         use_fast=False, # Fast tokenizer giving issues.
         tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
@@ -537,12 +534,12 @@ class DataCollatorForMHLM:
         self.num_cols = len(prompt)-1
         for i in range(1, len(prompt)):
             prompt[i] = f'{self.tokenizer.cls_token}' + prompt[i]
-        print(prompt)
+        # print(prompt)
         self.prompt_ids, _ = self.tokenizer(prompt,
             add_special_tokens=False).values() 
         self.prompt_ids = [torch.as_tensor(chunk) for chunk in self.prompt_ids] # removes EOS tokens, make into tensors
         self.prompt_ids = [chunk[chunk!=29871] for chunk in self.prompt_ids]
-        print(self.prompt_ids)
+        # print(self.prompt_ids)
         self.col_tok = self.tokenizer(f'{self.tokenizer.cls_token}', add_special_tokens=False)['input_ids'][0] #3
         
     
@@ -561,7 +558,7 @@ class DataCollatorForMHLM:
         targets_tok = targets['input_ids'].reshape((batch_size, self.num_cols, targets['input_ids'].shape[-1])) 
         # add extra pad token at end so all have padding
         targets_tok = torch.cat((targets_tok, torch.full((batch_size, self.num_cols, 1), self.tokenizer.pad_token_id)), dim=2)
-        print('targets_tok', targets_tok.shape)
+        # print('targets_tok', targets_tok.shape)
     
         blanks = torch.full(targets_tok.shape, self.tokenizer.pad_token_id) #also bs x num_col x tokens
         input_ids_list = []
@@ -576,8 +573,8 @@ class DataCollatorForMHLM:
         input_ids = torch.cat(input_ids_list, dim=1).long() # bs x (prompt_length + targets'_tokens_length)
         labels = torch.cat(labels_list, dim=1).long()
         # print('prompt_ids', [c.shape for c in self.prompt_ids])
-        print('input_ids', input_ids.shape, input_ids)
-        print('labels   ', labels.shape, labels)
+        # print('input_ids', input_ids.shape, input_ids)
+        # print('labels   ', labels.shape, labels)
         
         # start of the pad tokens where model predictions should get inserted:
         insert_indices = torch.empty((self.num_cols+1), dtype=torch.int)

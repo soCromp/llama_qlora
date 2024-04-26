@@ -20,7 +20,8 @@ python qlora.py \
     --logging_strategy steps \
     --remove_unused_columns False \
     --do_train True \
-    --eval_samples True \
+    --eval_samples False \
+    --do_eval False \
     --do_mmlu_eval False \
     --diversity False \
     --divdist manhattan \
@@ -34,7 +35,7 @@ python qlora.py \
     --warmup_ratio 0.03 \
     --lr_scheduler_type constant \
     --gradient_checkpointing \
-    --dataset /mnt/data/sonia/honeygan/cloze_apr18.dat \
+    --dataset /mnt/data/sonia/honeygan/apr23.dat \
     --source_max_len 60 \
     --target_max_len 150 \
     --per_device_train_batch_size 1 \
