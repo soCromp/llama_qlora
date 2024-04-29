@@ -14,12 +14,6 @@ import json
 import os
 from copy import deepcopy
 
-# structure: Peft model (Qlora) > Lora model (base_model)  > Normal model > Headless version of normal model
-# ohmodel: PeftModelForCausalLM             > LoraModel > LlamaForCausalLM          > LlamaModel
-# mhmodel: MultiHeadPeftModelForCausalLM    > LoraModel > MultiheadLlamaForCausalLM > LlamaModel
-
-GreedySearchOutput = Union[GreedySearchEncoderDecoderOutput, GreedySearchDecoderOnlyOutput]
-
 
 class MHLlamaConfig(LlamaConfig):
     model_type = "mhllama"
@@ -73,12 +67,14 @@ class MHLlamaConfig(LlamaConfig):
         self.col_token_id = col_token_id
 
 
+class MOELlamaDecoderLayer(LlamaDecoderLayer):
+    def __init__(self, config: MHLlamaConfig, layer_idx: int):
+        super().__init__()
+        self.mlp = ModuleList(config.num_heads*[self.mlp])
+
+
 class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
     config_class = MHLlamaConfig
-    _tied_weights_keys = ["heads.0.weight"]
-    _tied_weights_keys = ["heads.1.weight"]
-    _tied_weights_keys = ["heads.2.weight"]
-    _tied_weights_keys = ["heads.3.weight"]
     
     def __init__(self, config):
         super().__init__(config) #['llamamodel_config']
