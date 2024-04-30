@@ -257,13 +257,17 @@ class GenerationArguments:
     # https://huggingface.co/docs/transformers/main_classes/text_generation#transformers.GenerationConfig
     # Length arguments
     max_new_tokens: Optional[int] = field(
-        default=256,
+        default=10000,
         metadata={"help": "Maximum number of new tokens to be generated in evaluation or prediction loops"
                           "if predict_with_generate is set."}
     )
     min_new_tokens : Optional[int] = field(
         default=None,
         metadata={"help": "Minimum number of new tokens to generate."}
+    )
+    max_column_len: Optional[int] = field(
+        default = 15,
+        metadata={"help": "Max new tokens to generate *per column* in each row."}
     )
 
     # Generation strategy
@@ -294,9 +298,9 @@ def find_all_linear_names(args, model):
         #     names = name.split('.')
         #     lora_module_names.add(names[-1])
     
-    # if args.num_heads > 1:
-    #     for i in range(args.num_heads):
-    #         lora_module_names.add(f'heads.{i}')
+    if args.num_heads > 1:
+        for i in range(args.num_heads):
+            lora_module_names.add(f'heads.{i}')
     # if 'lm_head' in lora_module_names: # needed for 16-bit
     #     lora_module_names.remove('lm_head')
     return list(lora_module_names)
@@ -525,20 +529,27 @@ def smart_tokenizer_and_embedding_resize(
 @dataclass
 class DataCollatorForMHLM:
     
-    def __init__(self, tokenizer, source_max_len, target_max_len, train_on_source, predict_with_generate, prompt):
+    def __init__(self, tokenizer, source_max_len, target_max_len, train_on_source, predict_with_generate, prompt, max_column_len):
         self.tokenizer = tokenizer
         self.source_max_len = source_max_len
         self.target_max_len = target_max_len
         self.predict_with_generate = predict_with_generate
+        self.max_column_len = max_column_len
         
         self.num_cols = len(prompt)-1
         for i in range(1, len(prompt)):
             prompt[i] = f'{self.tokenizer.cls_token}' + prompt[i]
+            
+        prompt[0] = str(self.tokenizer.bos_token) + str(prompt[0])
+        prompt[1] = str(prompt[-1]) + str(self.tokenizer.eos_token)
         # print(prompt)
+        
         self.prompt_ids, _ = self.tokenizer(prompt,
             add_special_tokens=False).values() 
-        self.prompt_ids = [torch.as_tensor(chunk) for chunk in self.prompt_ids] # removes EOS tokens, make into tensors
-        self.prompt_ids = [chunk[chunk!=29871] for chunk in self.prompt_ids]
+        self.prompt_ids = [torch.as_tensor(chunk) for chunk in self.prompt_ids] 
+        
+        self.prompt_head_inds = [torch.zeros_like(chunk) for chunk in self.prompt_ids]
+        # self.prompt_ids = [chunk[chunk!=29871] for chunk in self.prompt_ids]
         # print(self.prompt_ids)
         self.col_tok = self.tokenizer(f'{self.tokenizer.cls_token}', add_special_tokens=False)['input_ids'][0] #3
         
@@ -548,48 +559,57 @@ class DataCollatorForMHLM:
         instances= pd.DataFrame(instances)
         # Extract elements
         batch_size = len(instances)
+        if len(instances.columns) > 1: 
+            include_labels = True
+        else:
+            include_labels = False
         instances = instances.drop('length', axis=1)
         
-        targets = self.tokenizer(instances.values.reshape((1,-1))[0].tolist(),  # (num_cols*batch_size,) ndarray row1col1 row1col2 ... row2col1 row2col2 etc
-                                 add_special_tokens=False, padding=True, return_tensors='pt')
-        # batch_size*num_cols x longest_tokens,  pads tokens with 0s
+        if include_labels:
+            # tokenize column labels
+            targets = self.tokenizer(instances.values.reshape((1,-1))[0].tolist(),  # (num_cols*batch_size,) ndarray row1col1 row1col2 ... row2col1 row2col2 etc
+                                    add_special_tokens=False, padding=True, return_tensors='pt')
+            col_tokens_len = targets['input_ids'].shape[-1]
+            # batch_size*num_cols x longest_tokens,  pads tokens with 0s
+            
+            # batch_size x num_cols x longest_tokens:
+            targets_tok = targets['input_ids'].reshape((batch_size, self.num_cols, col_tokens_len)) 
+            # add extra pad token at end so all have padding
+            targets_tok = torch.cat((targets_tok, torch.full((batch_size, self.num_cols, 1), self.tokenizer.pad_token_id)), dim=2)
+            # print('targets_tok', targets_tok.shape)
         
-        # batch_size x num_cols x longest_tokens:
-        targets_tok = targets['input_ids'].reshape((batch_size, self.num_cols, targets['input_ids'].shape[-1])) 
-        # add extra pad token at end so all have padding
-        targets_tok = torch.cat((targets_tok, torch.full((batch_size, self.num_cols, 1), self.tokenizer.pad_token_id)), dim=2)
-        # print('targets_tok', targets_tok.shape)
-    
-        blanks = torch.full(targets_tok.shape, self.tokenizer.pad_token_id) #also bs x num_col x tokens
-        input_ids_list = []
-        labels_list = [] 
-        for i in range(self.num_cols):
-            stretch_chunk = self.prompt_ids[i].repeat(batch_size, 1) # bs x tokens
-            input_ids_list.extend([stretch_chunk, blanks[:, i, :]])
-            labels_list.extend([stretch_chunk, targets_tok[:,i,:]])
-        stretch_chunk = self.prompt_ids[-1].repeat(batch_size, 1)
-        input_ids_list.append(stretch_chunk)
-        labels_list.append(stretch_chunk)
-        input_ids = torch.cat(input_ids_list, dim=1).long() # bs x (prompt_length + targets'_tokens_length)
-        labels = torch.cat(labels_list, dim=1).long()
+            # insert column labels into proper places within cloze prompt
+            labels_list = [] 
+            for i in range(self.num_cols):
+                stretch_chunk = self.prompt_ids[i].repeat(batch_size, 1) # bs x tokens
+                labels_list.extend([stretch_chunk, targets_tok[:,i,:]])
+            stretch_chunk = self.prompt_ids[-1].repeat(batch_size, 1)
+            labels_list.append(stretch_chunk)
+            labels = torch.cat(labels_list, dim=1).long()
+            
+            input_ids = copy.deepcopy(labels)
+            attention_mask = labels.ne(self.tokenizer.pad_token_id)
+            
+        else: #not include labels
+            col_tokens_len = self.max_column_len
+            input_ids = torch.full((batch_size, 1), self.tokenizer.bos_token_id)
+            attention_mask = torch.ones_like(input_ids)
+        
+        # form head_inds
+        col_head_inds = [be.squeeze() for be in torch.split(torch.arange(1,self.num_cols+1).unsqueeze(1).repeat(1,col_tokens_len),1)]
+        head_inds = torch.cat( sum(([ae,be] for ae,be in zip(self.prompt_head_inds, col_head_inds)), []) ) #intersperse then cat
+        
         # print('prompt_ids', [c.shape for c in self.prompt_ids])
         # print('input_ids', input_ids.shape, input_ids)
         # print('labels   ', labels.shape, labels)
         
-        # start of the pad tokens where model predictions should get inserted:
-        insert_indices = torch.empty((self.num_cols+1), dtype=torch.int)
-        insert_indices[0] = -1 # for convenience of indexing inside the model
-        insert_indices[1:] = torch.where(input_ids[0] == self.tokenizer.pad_token_id)[0][::targets_tok.shape[2]]
-        #                      since ea ex the same^           input_ids==0                        pad tokens per column
-        # print(insert_indices)
-        
         data_dict = {
             'input_ids': input_ids,
-            'attention_mask':input_ids.ne(self.tokenizer.pad_token_id),
-            # 'targets': targets_tok,
-            'labels': labels,
-            'insert_indices': insert_indices
+            'attention_mask': attention_mask,
+            'head_inds': head_inds
         }
+        if include_labels:
+            data_dict['labels'] = labels
         return data_dict
     
 
@@ -761,6 +781,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         train_on_source=args.train_on_source,
         predict_with_generate=args.predict_with_generate,
         prompt = dataset['prompt']['prompt'],
+        max_column_len = args.generation_config.max_column_len,
     )
     return dict(
         train_dataset=train_dataset if args.do_train else None,

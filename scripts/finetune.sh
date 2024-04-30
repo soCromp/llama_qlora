@@ -4,7 +4,7 @@ python qlora.py \
     --head_assembly follow \
     --head_loss rearrange \
     --use_auth \
-    --output_dir /mnt/data/sonia/ckpts/clozehead \
+    --output_dir /mnt/data/sonia/ckpts/clozefthead \
     --logging_steps 10 \
     --save_strategy steps \
     --data_seed 42 \
