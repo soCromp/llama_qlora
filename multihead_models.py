@@ -2,7 +2,8 @@ from peft import AutoPeftModelForCausalLM, PeftModelForCausalLM, get_peft_config
 from transformers import AutoTokenizer, LlamaTokenizer, LlamaConfig
 from transformers.generation.utils import * 
 from transformers.models.llama.modeling_llama import *
-from transformers.modeling_outputs import CausalLMOutputWithPast
+# from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.utils import ModelOutput
 from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.generation.configuration_utils import GenerationConfig
@@ -14,6 +15,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss, ModuleList, L
 import json
 import os
 from copy import deepcopy
+import wandb
 
 
 class MHLlamaConfig(LlamaConfig):
@@ -326,6 +328,10 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
         self.num_heads = config.num_heads
         self.mh_config = config
+        self.head_inds = None
+        self.prompt_template = None # set this and head_inds by calling set_templates
+        self.vocab_masks = None
+        self.max_column_len = None
         
         headlist = []
         # self.heads = nn.ModuleList()
@@ -336,6 +342,10 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         
         self.post_init() # Initialize weights and apply final processing
         self.trace = False # for debugging
+        
+        
+    def set_templates(self, templates):
+        self.head_inds, self.prompt_template, self.vocab_masks, self.max_column_len = templates
         
 
     def get_input_embeddings(self):
@@ -357,42 +367,10 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         return self.model
     
     
-    def get_heads_logits(self, hidden_states, input_ids, insert_indices, return_individual_preds=False):
-        """return_individual_preds is if you want to see what is output by each individual head"""
-        print('in get_heads_logits, hidden states', hidden_states.shape)
-        preds = []
-        for i in range(self.num_heads):
-            # print('\t', i, insert_indices[i]+1, insert_indices[i+1])
-            pred = self.heads[i](hidden_states.float()) # batch_size x tokens x vocab_size
-            preds.extend((pred[:, insert_indices[i]+1:insert_indices[i+1], :], pred[:, -1:, :]))
-        preds.append(pred[:, insert_indices[-1]+1:, :]) # just to get the last col_token marker after the last head, plus a filler token at very end
-        # print('input ids shape', input_ids.shape)
-        # print('shapes in preds', [p.shape for p in preds])
-        # print('assembled preds', torch.cat(preds, dim=1).shape)
-        return torch.cat(preds, dim=1) # batch_size x tokens x vocab_size
-    
-    
-    def insert_cols_to_prompt(self, prompt, cols):
-        """prompt: 1 x tokensp tensor
-            cols: batch_size x num_cols x tokensc tensor
-            returns sents: a batch_size x tokensp+num_cols*tokensc tensor, with cols inserted at cls_token locations"""
-        batch_size = cols.shape[0]
-        indices = torch.where(prompt==self.mh_config.col_token_id)[0] + 1 #so col_token_id will be at end of each split, not the start
-        # tuple with num_cols elements. i-th element is prompt between (i-1)th and ith head, plus i-th col token:
-        splits = torch.tensor_split(prompt, indices.cpu()) 
-        splitscols = []
-        for i, split in enumerate(splits):
-            splitm = split.repeat(batch_size, 1) #batch_size x tokens
-            splitcol = torch.cat((splitm[:, :-1], cols[:, i, :], splitm[:, -1]), dim=1) #dim1 changes, dim0 stay same
-            #                       prompt chunch   col target/pred     col token
-            splitscols.append(splitcol)
-        return torch.cat(splitscols, dim=1)
-        
-    
     def forward(
         self,
-        head_inds: torch.Tensor,
         input_ids: torch.LongTensor = None,
+        col: int = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -403,28 +381,21 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[Tuple, ModelOutput]:
         r"""
         Modified from LlamaForCausalLM forward()
         ```"""
-        if self.trace: 
-            print('in forward')
-            print(input_ids, attention_mask, labels)
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
-        # blanks = torch.ones_like(labels) # batch_size x num_cols x targets_len tensor
-        # inputs = self.insert_cols_to_prompt(input_ids, blanks) #batch_size x total_tokens
 
         if self.trace:
-            print('in forward. input_ids', input_ids, 'attention mask', attention_mask, 'label', labels)
+            print('in forward. input_ids', input_ids, 'label', labels)
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        if len(head_inds.shape) == 0: # for generation, where we go token by token thus column is known
-            col = head_inds.item()
+        if col is not None: # for generation, where we go token by token thus column is known
             outputs = self.model(
                 column=col,
                 input_ids=input_ids,
@@ -469,7 +440,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                 output = (logits,) + outputs[1:]
                 return (loss,) + output if loss is not None else output
 
-            return CausalLMOutputWithPast(
+            return ModelOutput(
                 loss=loss,
                 logits=logits,
                 past_key_values=outputs.past_key_values,
@@ -480,6 +451,8 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             outputs = []
             hidden_states = []
             logits = torch.zeros((input_ids.shape[0], input_ids.shape[1], self.vocab_size)) #batchsize x tokens x vocab
+            loss_by_col = {}
+            loss_cum = 0
             for i in range(self.num_heads):
                 output = self.model(
                     column=i,
@@ -497,7 +470,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                 outputs.append(output)
 
                 hidden_states = output[0] # batch_size x tokens x 4096
-            # print(hidden_states.shape)
+                # print(hidden_states.shape)
 
                 if self.config.pretraining_tp > 1:
                     return ValueError('unsupported hyperparameter pretraining tp > 1')
@@ -505,30 +478,62 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                     logit = self.heads[i](hidden_states)
                     logit = logit.float() # logits are batch_size x tokens x 32000 (vocab size)
                     logits=logits.to(logit.device)
-                    logits[:, torch.where(head_inds == i)[0], :] = logit[:, torch.where(head_inds == i)[0], :]
+                    logits[:, torch.where(self.head_inds == i)[0], :] = logit[:, torch.where(self.head_inds == i)[0], :]
+                    # print(i, logit[:, torch.where(head_inds == i)[0], :].argmax(dim=-1))
+                    
+                    if self.trace:
+                        print('logits argmax', logits.argmax(dim=-1))
+                    
+                    
+                    if labels is not None:
+                        shift_logits = logits[..., :-1, :]
+                        shift_logits = shift_logits[:, torch.where(self.head_inds == i)[0], :].contiguous()
+                        shift_labels = labels[..., 1:]
+                        shift_labels = shift_labels[:, torch.where(self.head_inds == i)[0]].contiguous()
+                        loss_fct = CrossEntropyLoss(reduction='sum')
+                        shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                        shift_labels = shift_labels.view(-1)
+                        # Enable model parallelism
+                        shift_labels = shift_labels.to(shift_logits.device)
+                        # print(i, 'labels', shift_labels, 'logits', shift_logits.argmax(dim=-1))
+                        loss = loss_fct(shift_logits, shift_labels)
+                        loss_by_col[str(i)]=loss
+                        loss_cum += loss
+                        
+                    
+            # if self.trace:       
+            #     print('logits argmax', logits.argmax(dim=-1))
+            #     print('logits', logits.shape, 'labels', labels.shape)
 
-            loss = None
-            if labels is not None:
-                # print('logits', logits.shape, 'labels', labels.shape)
-                # Shift so that tokens < n predict n
-                shift_logits = logits[..., :-1, :].contiguous() # TODO? is this needed still?
-                shift_labels = labels[..., 1:].contiguous()
-                # print('logits', shift_logits.shape, 'labels', shift_labels.shape)
-                # Flatten the tokens
-                loss_fct = CrossEntropyLoss()
-                shift_logits = shift_logits.view(-1, self.config.vocab_size)
-                shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                # print('logits', shift_logits.shape, 'labels', shift_labels.shape)
-                loss = loss_fct(shift_logits, shift_labels)
+            # loss = None
+            # if labels is not None:
+            #     # print('logits', logits.shape, 'labels', labels.shape)
+            #     # Shift so that tokens < n predict n
+            #     shift_logits = logits[..., :-1, :].contiguous() 
+            #     # shift_logits = logits[:, torch.where(head_inds>0)[0], :].contiguous() 
+            #     shift_labels = labels[..., 1:].contiguous() 
+            #     # shift_labels = labels[:, torch.where(head_inds>0)[0]].contiguous()
+            #     # print('logits', shift_logits.shape, 'labels', shift_labels.shape)
+            #     # Flatten the tokens
+            #     loss_fct = CrossEntropyLoss(reduction='sum')
+            #     shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            #     shift_labels = shift_labels.view(-1)
+            #     # Enable model parallelism
+            #     shift_labels = shift_labels.to(shift_logits.device)
+            #     # print('logits', shift_logits.shape, 'labels', shift_labels.shape)
+            #     loss = loss_fct(shift_logits, shift_labels)
+            
+            
+            self.to_log = loss_by_col
+            self.to_log['total'] = loss_cum
 
             if not return_dict:
                 output = (logits,) #+ outputs[1:]
                 return (loss,) #+ output if loss is not None else output
 
-            return CausalLMOutputWithPast(
-                loss=loss,
+            return ModelOutput(
+                loss=loss_cum,
+                losses=loss_by_col,
                 logits=logits,
                 # past_key_values=outputs.past_key_values,
                 # hidden_states=outputs.hidden_states, #hidden_states, #
@@ -538,6 +543,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         
     def can_generate(self): return True
     
+    
     def set_trace(self, value):
         self.trace = value
     
@@ -545,7 +551,6 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
     def _greedy_search(
         self,
         input_ids: torch.LongTensor,
-        head_inds: torch.Tensor,
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         max_length: Optional[int] = None,
@@ -564,11 +569,11 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         if max_length is not None:
-            warnings.warn(
-                "`max_length` is deprecated in this function, use"
-                " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
-                UserWarning,
-            )
+            # warnings.warn(
+            #     "`max_length` is deprecated in this function, use"
+            #     " `stopping_criteria=StoppingCriteriaList([MaxLengthCriteria(max_length=max_length)])` instead.",
+            #     UserWarning,
+            # )
             stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
@@ -610,14 +615,21 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
         
-        # cur_tok = cur_len
+        prep = True # during successive iters, don't prep if prev generated token is padding
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+            if cur_len == self.head_inds.shape[0]: break
             # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if prep:
+                model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             
+            if self.trace:
+                print('model_inputs', model_inputs['input_ids'], model_inputs['position_ids'])    
+                print('about to generate token', cur_len, 'with head', self.head_inds[cur_len-1].item())
+                
+            # print(self.head_inds[cur_len-1])
             # forward pass to get next token
             outputs = self(
-                head_inds=head_inds[cur_len],
+                col=self.head_inds[cur_len-1],
                 **model_inputs,
                 return_dict=True,
                 output_attentions=output_attentions,
@@ -626,11 +638,14 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
 
             if synced_gpus and this_peer_finished:
                 continue  # don't waste resources running the code we don't need
+            
+            if self.trace:
+                print('logits argmax', outputs.logits.argmax(dim=-1))
 
             next_token_logits = outputs.logits[:, -1, :]
 
             # pre-process distribution
-            next_tokens_scores = logits_processor(input_ids, next_token_logits)
+            next_tokens_scores = logits_processor(input_ids, next_token_logits) #batch_size x vocab_size
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
@@ -653,12 +668,28 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                     )
 
             # argmax
-            next_tokens = torch.argmax(next_tokens_scores, dim=-1)
+            if self.trace:
+                print('next token scores', next_tokens_scores.shape)
+                
+            if self.head_inds[cur_len-1] > 0:
+                forbidden=torch.where(self.vocab_masks[self.head_inds[cur_len-1]-1] == 0)[0]
+                next_tokens_scores[:, forbidden] = float('-inf') # zero out forbidden words
+                probs = nn.functional.softmax(next_tokens_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)
+                # next_tokens = torch.argmax(next_tokens_scores, dim=-1).unsqueeze(dim=1)
+            else:
+                next_tokens = torch.full((input_ids.shape[0], 1), self.prompt_template[cur_len-1])
+                
+            if self.trace:
+                print(next_tokens)
+                
+                
+            input_ids = torch.cat([input_ids, next_tokens], dim=-1)
 
-            # finished sentences should have their next token be a padding token
-
-            # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            # finished sentences should have their next token be a padding token TODO
+            
+            if self.trace:
+                print('input ids update', input_ids)
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -667,35 +698,29 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                 is_encoder_decoder=self.config.is_encoder_decoder,
             )
 
-            # if eos_token was found in one sentence, set sentence to finished
+            # if eos_token was found in one sentence, set sentence to finished TODO
+            
+            cur_len +=1
+            if self.trace:
+                print(cur_len, 'cur_len')
             
         if streamer is not None:
             streamer.end()
+            
+        preds = input_ids[:, torch.where(self.head_inds!=0)[0]+1].reshape((input_ids.shape[0], self.num_heads-1, -1))
 
         if return_dict_in_generate:
-            if self.config.is_encoder_decoder:
-                return GenerateEncoderDecoderOutput(
-                    sequences=input_ids,
-                    scores=scores,
-                    logits=raw_logits,
-                    encoder_attentions=encoder_attentions,
-                    encoder_hidden_states=encoder_hidden_states,
-                    decoder_attentions=decoder_attentions,
-                    cross_attentions=cross_attentions,
-                    decoder_hidden_states=decoder_hidden_states,
-                    past_key_values=model_kwargs.get("past_key_values"),
-                )
-            else:
-                return GenerateDecoderOnlyOutput(
-                    sequences=input_ids,
-                    scores=scores,
-                    logits=raw_logits,
-                    attentions=decoder_attentions,
-                    hidden_states=decoder_hidden_states,
-                    past_key_values=model_kwargs.get("past_key_values"),
-                )
+            return GenerateDecoderOnlyOutput(
+                sequences=input_ids,
+                predictions=preds,
+                scores=scores,
+                logits=raw_logits,
+                attentions=decoder_attentions,
+                hidden_states=decoder_hidden_states,
+                past_key_values=model_kwargs.get("past_key_values"),
+            )
         else:
-            return input_ids
+            return input_ids, preds
         
     
     
@@ -1137,7 +1162,6 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             print('in prepare inputs for generation with args', input_ids.shape, type(past_key_values), type(attention_mask), type(inputs_embeds), 
                 type(cache_position), kwargs, sep='\n')
         # With static cache, the `past_key_values` is None
-        # TODO joao: standardize interface for the different Cache classes and remove of this if
         has_static_cache = False
         if past_key_values is None:
             past_key_values = getattr(getattr(self.model.layers[0], "self_attn", {}), "past_key_value", None)
@@ -1158,27 +1182,22 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                 cache_length = past_length = past_key_values[0][0].shape[2] # number of toks in prev generation iter
                 max_cache_length = None
             
-            if self.trace:
-                print('past_length', past_length, 'cache_length', cache_length, 'max_cache_length', max_cache_length)
+            # print('past_length', past_length, 'cache_length', cache_length, 'max_cache_length', max_cache_length)
 
             # Keep only the unprocessed tokens:
             # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
             # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
             # input)
             if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                if self.trace:
-                    print('input_ids case 1 before', input_ids.shape)
+                # print('input_ids case 1 before', input_ids.shape)
                 input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-                if self.trace:
-                    print('input_ids case 1 after ', input_ids.shape)
+                # print('input_ids case 1 after ', input_ids.shape)
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
             elif past_length < input_ids.shape[1]:
-                if self.trace:
-                    print('input_ids case 2 before', input_ids.shape)
+                # print('input_ids case 2 before', input_ids.shape)
                 input_ids = input_ids[:, past_length:]
-                if self.trace:
-                    print('input_ids case 2 after ', input_ids.shape)
+                # print('input_ids case 2 after ', input_ids.shape)
             # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
 
             # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
@@ -1194,12 +1213,10 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
             # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if self.trace:
-                print('position_ids', position_ids)
+            # print('position_ids', position_ids)
             if past_key_values:
                 position_ids = position_ids[:, -input_ids.shape[1] :]
-            if self.trace:
-                print('position_ids', position_ids)
+            # print('position_ids', position_ids)
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
@@ -1218,12 +1235,9 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
 
         if has_static_cache:
             past_key_values = None
-            
-        # insert_indices += torch.arange(0, insert_indices.shape[0]) # since ea col has one more token added to it
 
         model_inputs.update(
             {
-                # "insert_indices": insert_indices,
                 "position_ids": position_ids, # indices of input_ids to "look at"
                 "cache_position": cache_position,
                 "past_key_values": past_key_values, # from attention mechanism of headless LLamaModel

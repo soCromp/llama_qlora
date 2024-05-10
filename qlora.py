@@ -55,6 +55,10 @@ from peft import PeftModel
 
 from multihead_models import MultiheadLlamaForCausalLM, MHLlamaConfig
 
+from transformers.integrations import WandbCallback
+
+from datetime import datetime
+
 
 def is_ipex_available():
     def get_major_and_minor_from_version(full_version):
@@ -243,6 +247,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
     gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
     do_train: bool = field(default=True, metadata={"help": 'To train or not to train, that is the question?'})
+    do_generate: bool = field(default=True, metadata={"help": 'To gen or not to gen, that is the question?'})
     lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
     warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
     logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
@@ -529,19 +534,21 @@ def smart_tokenizer_and_embedding_resize(
 @dataclass
 class DataCollatorForMHLM:
     
-    def __init__(self, tokenizer, source_max_len, target_max_len, train_on_source, predict_with_generate, prompt, max_column_len):
+    def __init__(self, tokenizer, source_max_len, target_max_len, train_on_source, predict_with_generate, 
+                 prompt, vocab_masks, max_column_len):
         self.tokenizer = tokenizer
         self.source_max_len = source_max_len
         self.target_max_len = target_max_len
         self.predict_with_generate = predict_with_generate
         self.max_column_len = max_column_len
         
-        self.num_cols = len(prompt)-1
+        print(prompt)
+        self.num_cols = len(prompt)-1 #excludes prompt tokens/head
         for i in range(1, len(prompt)):
-            prompt[i] = f'{self.tokenizer.cls_token}' + prompt[i]
+            prompt[i] = (f'{self.tokenizer.cls_token}' + prompt[i]).strip()
             
-        prompt[0] = str(self.tokenizer.bos_token) + str(prompt[0])
-        prompt[1] = str(prompt[-1]) + str(self.tokenizer.eos_token)
+        prompt[0] = (str(self.tokenizer.bos_token) + str(prompt[0])).strip()
+        prompt[-1] = str(prompt[-1]) + str(self.tokenizer.eos_token)
         # print(prompt)
         
         self.prompt_ids, _ = self.tokenizer(prompt,
@@ -549,9 +556,23 @@ class DataCollatorForMHLM:
         self.prompt_ids = [torch.as_tensor(chunk) for chunk in self.prompt_ids] 
         
         self.prompt_head_inds = [torch.zeros_like(chunk) for chunk in self.prompt_ids]
-        # self.prompt_ids = [chunk[chunk!=29871] for chunk in self.prompt_ids]
+        self.prompt_head_inds[0] = self.prompt_head_inds[0][1:] # removes BOS token, accounts for model shift all to left
         # print(self.prompt_ids)
         self.col_tok = self.tokenizer(f'{self.tokenizer.cls_token}', add_special_tokens=False)['input_ids'][0] #3
+        
+        self.vocab_masks = torch.as_tensor(pd.DataFrame(vocab_masks[:]).to_numpy().T, dtype=torch.bool) # num_cols x 32000 (or vocab size)
+        
+        
+    def get_templates(self):
+        # form head_inds
+        col_head_inds = [be.squeeze() for be in torch.split(torch.arange(1,self.num_cols+1).unsqueeze(1).repeat(1,self.max_column_len),1)]
+        head_inds = torch.cat( sum(([ae,be] for ae,be in zip(self.prompt_head_inds, col_head_inds)), []) +  [self.prompt_head_inds[-1]]) 
+        #                                                      intersperse                               ^ since there's 1 more prompt, won't be in zip
+        
+        # for generation
+        prompt_template = torch.zeros_like(head_inds, dtype=torch.long)
+        prompt_template[torch.where(head_inds==0)] = torch.cat(self.prompt_ids, dim=0)[1:]
+        return head_inds, prompt_template, self.vocab_masks, self.max_column_len
         
     
     def __call__(self, instances: Sequence[Dict]) -> Dict:
@@ -568,14 +589,13 @@ class DataCollatorForMHLM:
         if include_labels:
             # tokenize column labels
             targets = self.tokenizer(instances.values.reshape((1,-1))[0].tolist(),  # (num_cols*batch_size,) ndarray row1col1 row1col2 ... row2col1 row2col2 etc
-                                    add_special_tokens=False, padding=True, return_tensors='pt')
+                                    add_special_tokens=False, padding='max_length', return_tensors='pt', max_length=self.max_column_len, truncation=True)
             col_tokens_len = targets['input_ids'].shape[-1]
-            # batch_size*num_cols x longest_tokens,  pads tokens with 0s
+            # batch_size*num_cols x max_column_len,  pads tokens with 0s
+            # print('targets', targets['input_ids'], targets['input_ids'].shape, self.max_column_len)
             
-            # batch_size x num_cols x longest_tokens:
-            targets_tok = targets['input_ids'].reshape((batch_size, self.num_cols, col_tokens_len)) 
-            # add extra pad token at end so all have padding
-            targets_tok = torch.cat((targets_tok, torch.full((batch_size, self.num_cols, 1), self.tokenizer.pad_token_id)), dim=2)
+            # batch_size x num_cols x max_column_len:
+            targets_tok = targets['input_ids'].reshape((batch_size, self.num_cols, self.max_column_len)) 
             # print('targets_tok', targets_tok.shape)
         
             # insert column labels into proper places within cloze prompt
@@ -586,30 +606,30 @@ class DataCollatorForMHLM:
             stretch_chunk = self.prompt_ids[-1].repeat(batch_size, 1)
             labels_list.append(stretch_chunk)
             labels = torch.cat(labels_list, dim=1).long()
+            # print(labels[0].shape, self.head_inds.shape,)
+            # assert(labels.shape[1]-1 == self.head_inds.shape[0])
             
             input_ids = copy.deepcopy(labels)
-            attention_mask = labels.ne(self.tokenizer.pad_token_id)
+            attention_mask = torch.ones_like(input_ids) # labels.ne(self.tokenizer.pad_token_id)
+            data_dict = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'labels': labels
+            }
             
         else: #not include labels
-            col_tokens_len = self.max_column_len
-            input_ids = torch.full((batch_size, 1), self.tokenizer.bos_token_id)
+            input_ids = torch.tile(input=torch.as_tensor((self.tokenizer.bos_token_id, self.prompt_ids[0][1]), dtype=torch.long), 
+                                   dims=(batch_size, 1))
             attention_mask = torch.ones_like(input_ids)
-        
-        # form head_inds
-        col_head_inds = [be.squeeze() for be in torch.split(torch.arange(1,self.num_cols+1).unsqueeze(1).repeat(1,col_tokens_len),1)]
-        head_inds = torch.cat( sum(([ae,be] for ae,be in zip(self.prompt_head_inds, col_head_inds)), []) ) #intersperse then cat
+            data_dict = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+            }
         
         # print('prompt_ids', [c.shape for c in self.prompt_ids])
         # print('input_ids', input_ids.shape, input_ids)
         # print('labels   ', labels.shape, labels)
-        
-        data_dict = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'head_inds': head_inds
-        }
-        if include_labels:
-            data_dict['labels'] = labels
+            
         return data_dict
     
 
@@ -781,6 +801,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         train_on_source=args.train_on_source,
         predict_with_generate=args.predict_with_generate,
         prompt = dataset['prompt']['prompt'],
+        vocab_masks = dataset['vocab_masks'], # {'1':32000-list, '2':32000-list, etc}
         max_column_len = args.generation_config.max_column_len,
     )
     return dict(
@@ -804,6 +825,37 @@ def get_last_checkpoint(checkpoint_dir):
         return checkpoint_dir, is_completed # checkpoint found!
     return None, False # first training
 
+def sample(args, model, tokenizer):
+    dataname = args.dataset.split('/')[-2]
+    modelname = args.output_dir.split('/')[-1]
+    path = f'/mnt/data/sonia/datasets/synthetic/{dataname}/{modelname}.dat'
+    model = model.cpu().merge_and_unload()
+    collator = data_module['data_collator']
+    real = collator['train_dataset'].to_pandas().drop(['length'], axis=1)
+    tokenizer = collator.tokenizer
+    model.set_templates(collator.get_templates())
+    
+    preds = [ [] for _ in range(real.shape[1]) ]
+    batch_size = 100
+    num_samples = real.shape[0]
+    inputs = collator(batch_size*[{'length': 0}])
+    
+    print('beginning generation')
+
+    for batch in tqdm(range(num_samples//batch_size + 1)):
+        _, batch_col_toks = model.generate(**inputs) # batch_size x num_cols x max_column_len
+
+        for i, col in enumerate(real.columns):
+            options_str = real[col].unique()
+            options = tokenizer(options_str.tolist(), add_special_tokens=False, padding='max_length', return_tensors='pt', 
+                                max_length=args.generation_config.max_column_len, truncation=True)['input_ids']
+            preds_col = options_str[cosine_similarity(batch_col_toks[:, i, :], options).argmax(axis=1)]
+            preds[i].extend(preds_col)
+            
+            hp = Dataset.from_pandas(pd.DataFrame(preds).T)
+            hp.save_to_disk(path)
+
+
 def train():
     hfparser = transformers.HfArgumentParser((
         ModelArguments, DataArguments, TrainingArguments, GenerationArguments
@@ -814,6 +866,9 @@ def train():
     args = argparse.Namespace(
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
+    
+    os.environ["WANDB_PROJECT"]="mhllama"
+    os.environ['WANDB_RUN_ID']=args.output_dir.split('/')[-1] + datetime.now().strftime('-%m.%d-%H.%M')
     
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
     if completed_training:
@@ -826,6 +881,7 @@ def train():
     set_seed(args.seed)
 
     data_module = make_data_module(tokenizer=tokenizer, args=args)
+    model.set_templates(data_module['data_collator'].get_templates()) # head_inds and prompt_template
     
     if args.num_heads > 1:
         do_mlm_sample=True # controls whether to do multihead-style sampling, will be passed as generation arg
@@ -895,6 +951,16 @@ def train():
     # Callbacks
     if not args.full_finetune:
         trainer.add_callback(SavePeftModelCallback)
+    if args.report_to == ['wandb']:
+        print('adding wandb callback')
+        class WandbMetricsCallback(WandbCallback):
+            def on_substep_end(self, args, state, control, **kwargs):
+                self._wandb.log(model.to_log)
+            def on_prediction_step(self, args, state, control, **kwargs):
+                mets = {k+'_eval':model.to_log[k] for k in model.to_log}
+                self._wandb.log(model.to_log)
+                
+        trainer.add_callback(WandbMetricsCallback)
     if args.eval_samples:
         class evalSampleCallback(transformers.TrainerCallback):
             def on_evaluate(self, args, state, control, model, **kwargs):
@@ -1036,6 +1102,9 @@ def train():
         trainer.log_metrics("predict", prediction_metrics)
         trainer.save_metrics("predict", prediction_metrics)
         all_metrics.update(prediction_metrics)
+
+    if args.do_generate:
+        sample(args, model, data_collator)
 
     if (args.do_train or args.do_eval or args.do_predict):
         with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
