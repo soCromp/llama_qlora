@@ -53,33 +53,25 @@ from peft import PeftModel
 
 from sklearn.metrics.pairwise import cosine_similarity
 
-path = '/mnt/data/sonia/datasets/synthetic/adult/may10-2.dat'
-argdict = {
-  'model_name_or_path' : '/mnt/data/sonia/ckpts/adult-good/checkpoint-60', # './mhllama',
-  'num_heads': 7,
-  'max_column_len': 5,
-  'data_seed' : 42 ,
-  'per_device_eval_batch_size' : 1 ,
-  'dataloader_num_workers' : 1 ,
-  'bf16' : True,
-  'bits' : 4 ,
-  'dataset' : '/mnt/data/sonia/datasets/adult/may8.dat',
-  'seed' : 0,
-  'max_new_tokens': 500,
-}
-
-arglist = [f'--{k}={v}' for k,v in argdict.items()]
-
 hfparser = transformers.HfArgumentParser((
     ModelArguments, DataArguments, TrainingArguments, GenerationArguments
 ))
-model_args, data_args, training_args, generation_args  = hfparser.parse_args_into_dataclasses(args=arglist, return_remaining_strings=True)[:-1]
+model_args, data_args, training_args, generation_args   , extra_args = \
+    hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
 training_args.generation_config = transformers.GenerationConfig(**vars(generation_args))
 args = argparse.Namespace(
     **vars(model_args), **vars(data_args), **vars(training_args)
 )
 
 print('parsed args')
+
+# path = '/mnt/data/sonia/datasets/synthetic/adult/may10-2.dat'
+# path = 'debug.dat'
+dataname = args.dataset.split('/')[-2]
+modelname = args.output_dir.split('/')[-1]
+path = f'/mnt/data/sonia/datasets/synthetic/{dataname}/{modelname}.dat'
+os.makedirs(path, exist_ok=True)
+print('will save to', path)
 
 tokenizer = AutoTokenizer.from_pretrained('/mnt/data/zoo/llama2/llama2-7b-hf/',
         padding_side="right",
@@ -92,15 +84,18 @@ print('data loaded')
 transformers.AutoConfig.register('mhllama', MHLlamaConfig)
 transformers.AutoModelForCausalLM.register(MHLlamaConfig, MultiheadLlamaForCausalLM)
 
+model_path = os.path.join(args.output_dir, 'checkpoint-' +str(args.max_steps)) 
+print('will load model from', model_path)
+
 config = MHLlamaConfig(**vars(args))
 model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
+            model_path,
             config = config,)
 print('model loaded')
 
 model.set_templates(collator.get_templates())
-model = PeftModel.from_pretrained(model, join(args.model_name_or_path, 'adapter_model'), is_trainable=True)
-model = model.merge_and_unload().cuda()
+model = PeftModel.from_pretrained(model, join(model_path, 'adapter_model'), is_trainable=True)
+model = model.merge_and_unload()
 print('peft model unloaded')
 
 full_dataset = DatasetDict({})
@@ -110,10 +105,9 @@ for f in os.listdir(args.dataset):
 real = full_dataset['train'].to_pandas().drop(['length'], axis=1)
 
 preds = [ [] for _ in range(real.shape[1]) ]
-batch_size = 100
-num_samples = real.shape[0]
+batch_size = 50
+num_samples = 5000 # real.shape[0]
 inputs = collator(batch_size*[{'length': 0}])
-inputs={inputs[c].cuda() for c in inputs}
 
 print('beginning generation')
 

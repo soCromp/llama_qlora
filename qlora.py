@@ -787,9 +787,9 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             eval_dataset = eval_dataset.select(range(args.max_eval_samples))
         # if args.group_by_length and args.eval_dataset_size>0:
         #     eval_dataset = eval_dataset.map(lambda x: {'length': sum([len(x[col] for col in x)])})
-    if args.do_train:
+    if args.do_train or args.do_generate:
         train_dataset = dataset['train']
-        if args.max_train_samples is not None and len(train_dataset) > args.max_train_samples:
+        if args.do_train and args.max_train_samples is not None and len(train_dataset) > args.max_train_samples:
             train_dataset = train_dataset.select(range(args.max_train_samples))
         # if args.group_by_length:
         #     train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
@@ -805,7 +805,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         max_column_len = args.generation_config.max_column_len,
     )
     return dict(
-        train_dataset=train_dataset if args.do_train else None,
+        train_dataset=train_dataset if args.do_train or args.do_generate else None,
         eval_dataset=eval_dataset if args.do_eval else None,
         predict_dataset=eval_dataset if args.do_predict else None,
         data_collator=data_collator
@@ -814,7 +814,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
 def get_last_checkpoint(checkpoint_dir):
     if isdir(checkpoint_dir):
         is_completed = exists(join(checkpoint_dir, 'completed'))
-        if is_completed: return None, True # already finished
+        # if is_completed: return None, True # already finished
         max_step = 0
         for filename in os.listdir(checkpoint_dir):
             if isdir(join(checkpoint_dir, filename)) and filename.startswith('checkpoint'):
@@ -825,15 +825,31 @@ def get_last_checkpoint(checkpoint_dir):
         return checkpoint_dir, is_completed # checkpoint found!
     return None, False # first training
 
-def sample(args, model, tokenizer):
+def sample(args):
     dataname = args.dataset.split('/')[-2]
     modelname = args.output_dir.split('/')[-1]
     path = f'/mnt/data/sonia/datasets/synthetic/{dataname}/{modelname}.dat'
-    model = model.cpu().merge_and_unload()
+    
+    tokenizer = AutoTokenizer.from_pretrained('/mnt/data/zoo/llama2/llama2-7b-hf/',
+            padding_side="right",
+            use_fast=False, # Fast tokenizer giving issues.
+            )
+    data_module = make_data_module(tokenizer=tokenizer, args=args)
     collator = data_module['data_collator']
-    real = collator['train_dataset'].to_pandas().drop(['length'], axis=1)
+    real = data_module['train_dataset'].to_pandas().drop(['length'], axis=1)
     tokenizer = collator.tokenizer
+    
+    ckpt_path = get_last_checkpoint(args.output_dir)[0]
+    transformers.AutoConfig.register('mhllama', MHLlamaConfig)
+    transformers.AutoModelForCausalLM.register(MHLlamaConfig, MultiheadLlamaForCausalLM)
+    config = MHLlamaConfig(**vars(args))
+    print('loading from', ckpt_path)
+    model = AutoModelForCausalLM.from_pretrained(
+                ckpt_path,
+                config = config, device_map='cpu')
     model.set_templates(collator.get_templates())
+    model = PeftModel.from_pretrained(model, join(ckpt_path, 'adapter_model'), is_trainable=True)
+    model = model.merge_and_unload()
     
     preds = [ [] for _ in range(real.shape[1]) ]
     batch_size = 100
@@ -866,7 +882,7 @@ def train():
     args = argparse.Namespace(
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
-    
+    # print(args)
     os.environ["WANDB_PROJECT"]="mhllama"
     os.environ['WANDB_RUN_ID']=args.output_dir.split('/')[-1] + datetime.now().strftime('-%m.%d-%H.%M')
     
@@ -874,237 +890,239 @@ def train():
     if completed_training:
         print('Detected that training was already completed!')
 
-    model, tokenizer = get_accelerate_model(args, checkpoint_dir)
+    if args.do_train or args.do_eval or args.do_predict:
+        model, tokenizer = get_accelerate_model(args, checkpoint_dir)
 
-    model.config.use_cache = False
-    print('loaded model')
-    set_seed(args.seed)
+        model.config.use_cache = False
+        print('loaded model')
+        set_seed(args.seed)
 
-    data_module = make_data_module(tokenizer=tokenizer, args=args)
-    model.set_templates(data_module['data_collator'].get_templates()) # head_inds and prompt_template
-    
-    if args.num_heads > 1:
-        do_mlm_sample=True # controls whether to do multihead-style sampling, will be passed as generation arg
-    
-    if args.diversity:
-        class CustomSeq2SeqTrainer(Seq2SeqTrainer):
-            def compute_loss(self, model, inputs, return_outputs=False):
-                """
-                How the loss is computed by Trainer. By default, all models return the loss in the first element.
-
-                Subclass and override for custom behavior.
-                """
-                if self.label_smoother is not None and "labels" in inputs:
-                    labels = inputs.pop("labels")
-                else:
-                    labels = None
-                outputs = model(**inputs)
-                
-                # Save past state if it exists
-                # TODO: this needs to be fixed and made cleaner later.
-                if self.args.past_index >= 0:
-                    self._past = outputs[self.args.past_index]
-
-                if labels is not None:
-                    unwrapped_model = unwrap_model(model)
-                    if is_peft_available() and isinstance(unwrapped_model, PeftModel):
-                        model_name = unwrapped_model.base_model.model._get_name()
-                    else:
-                        model_name = unwrapped_model._get_name()
-                    if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-                        loss = self.label_smoother(outputs, labels, shift_labels=True)
-                    else:
-                        loss = self.label_smoother(outputs, labels)
-                else:
-                    if isinstance(outputs, dict) and "loss" not in outputs:
-                        raise ValueError(
-                            "The model did not return a loss from the inputs, only the following keys: "
-                            f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-                        )
-                    # We don't use .loss here since the model may return tuples instead of ModelOutput.
-                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-                    
-                # Diversity term
-                if args.divdist == 'manhattan':
-                    dist_matrix = manhattan(outputs.logits.squeeze())
-                elif args.divdist == 'cosine':
-                    dist_matrix = cossim(outputs.logits.squeeze())
-                else:
-                    return ValueError(f'Unsupported diversity distance function {args.divdist}')
-                dist_matrix = dist_matrix.to(outputs.logits.get_device()) / args.divc1
-                diversity = torch.mean(torch.exp(-dist_matrix)) * args.divc2
-                print(diversity)
-
-                return (loss+diversity, outputs) if return_outputs else loss+diversity
+        data_module = make_data_module(tokenizer=tokenizer, args=args)
+        model.set_templates(data_module['data_collator'].get_templates()) # head_inds and prompt_template
         
-        trainerclass = CustomSeq2SeqTrainer
-    else: trainerclass = Seq2SeqTrainer
-                
-    
-    trainer = trainerclass(
-        model=model,
-        tokenizer=tokenizer,
-        args=training_args,
-        **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
-    )
+        if args.num_heads > 1:
+            do_mlm_sample=True # controls whether to do multihead-style sampling, will be passed as generation arg
+        
+        if args.diversity:
+            class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+                def compute_loss(self, model, inputs, return_outputs=False):
+                    """
+                    How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
-    # Callbacks
-    if not args.full_finetune:
-        trainer.add_callback(SavePeftModelCallback)
-    if args.report_to == ['wandb']:
-        print('adding wandb callback')
-        class WandbMetricsCallback(WandbCallback):
-            def on_substep_end(self, args, state, control, **kwargs):
-                self._wandb.log(model.to_log)
-            def on_prediction_step(self, args, state, control, **kwargs):
-                mets = {k+'_eval':model.to_log[k] for k in model.to_log}
-                self._wandb.log(model.to_log)
-                
-        trainer.add_callback(WandbMetricsCallback)
-    if args.eval_samples:
-        class evalSampleCallback(transformers.TrainerCallback):
-            def on_evaluate(self, args, state, control, model, **kwargs):
-                trainer.model.eval()
-                metrics = trainer.predict(test_dataset=data_module['eval_dataset'],metric_key_prefix="predict")
-                
-                predictions = []
-                for i in range(len(metrics.predictions)):
-                    logit = metrics.predictions[i]
-                    print('logit', logit)
-                    print(logit.shape)
-                    label = metrics.label_ids[i] #just to see positions where prompt tokens are at
-                    print('label', label)
-                    print(label.shape)
-                    logit_abcd = logit[label != IGNORE_INDEX]
-                    toks = np.argmax(logit_abcd, axis=1)
-                    predictions.append(
-                        ''.join(trainer.tokenizer.decode(toks, skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n'
-                        )
-                
-                with open(os.path.join(args.output_dir, 'samples.txt'), 'a') as f:
-                    f.write(f'step {trainer.state.global_step}\n')
-                    f.writelines(predictions)
-                    f.write('\n\n')
+                    Subclass and override for custom behavior.
+                    """
+                    if self.label_smoother is not None and "labels" in inputs:
+                        labels = inputs.pop("labels")
+                    else:
+                        labels = None
+                    outputs = model(**inputs)
                     
-                print('\nsamples logged to ', os.path.join(args.output_dir, 'samples.txt'))
-                
-        trainer.add_callback(evalSampleCallback)
-    if args.do_mmlu_eval:
-        if args.mmlu_dataset == 'mmlu-zs':
-            mmlu_dataset = load_dataset("json", data_files={
-                'eval': 'data/mmlu/zero_shot_mmlu_val.json',
-                'test': 'data/mmlu/zero_shot_mmlu_test.json',
-            })
-            mmlu_dataset = mmlu_dataset.remove_columns('subject')
-        # MMLU Five-shot (Eval/Test only)
-        elif args.mmlu_dataset == 'mmlu' or args.mmlu_dataset == 'mmlu-fs':
-            mmlu_dataset = load_dataset("json", data_files={
-                'eval': 'data/mmlu/five_shot_mmlu_val.json',
-                'test': 'data/mmlu/five_shot_mmlu_test.json',
-            })
-            # mmlu_dataset = mmlu_dataset.remove_columns('subject')
-        mmlu_dataset = mmlu_dataset[args.mmlu_split]
-        if args.max_mmlu_samples is not None:
-            mmlu_dataset = mmlu_dataset.select(range(args.max_mmlu_samples))
-        abcd_idx = [
-            tokenizer("A", add_special_tokens=False).input_ids[0],
-            tokenizer("B", add_special_tokens=False).input_ids[0],
-            tokenizer("C", add_special_tokens=False).input_ids[0],
-            tokenizer("D", add_special_tokens=False).input_ids[0],
-        ]
-        accuracy = evaluate.load("accuracy")
-        class MMLUEvalCallback(transformers.TrainerCallback):
-            def on_evaluate(self, args, state, control, model, **kwargs):
-                data_loader = trainer.get_eval_dataloader(mmlu_dataset)
-                source_max_len = trainer.data_collator.source_max_len
-                trainer.data_collator.source_max_len = args.mmlu_source_max_len
-                trainer.model.eval()
-                preds, refs = [], []
-                loss_mmlu = 0
-                for batch in tqdm(data_loader, total=len(data_loader)):
-                    (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
-                    # There are two tokens, the output, and eos token.
-                    for i, logit in enumerate(logits):
-                        label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
-                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
-                        preds.append(torch.argmax(logit_abcd).item())
-                    labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
-                    refs += [abcd_idx.index(label) for label in labels.tolist()]
-                    loss_mmlu += loss.item()
-                # Extract results by subject.
-                results = {'mmlu_loss':loss_mmlu/len(data_loader)}
-                subject = mmlu_dataset['subject']
-                subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
-                for s,p,r in zip(subject, preds, refs):
-                    subjects[s]['preds'].append(p)
-                    subjects[s]['refs'].append(r)
-                subject_scores = []
-                for subject in subjects:
-                    subject_score = accuracy.compute(
-                        references=subjects[subject]['refs'],
-                        predictions=subjects[subject]['preds']
-                    )['accuracy']
-                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
-                    subject_scores.append(subject_score)
-                results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
-                trainer.log(results)
-                trainer.data_collator.source_max_len = source_max_len
+                    # Save past state if it exists
+                    # TODO: this needs to be fixed and made cleaner later.
+                    if self.args.past_index >= 0:
+                        self._past = outputs[self.args.past_index]
 
-        trainer.add_callback(MMLUEvalCallback)
+                    if labels is not None:
+                        unwrapped_model = unwrap_model(model)
+                        if is_peft_available() and isinstance(unwrapped_model, PeftModel):
+                            model_name = unwrapped_model.base_model.model._get_name()
+                        else:
+                            model_name = unwrapped_model._get_name()
+                        if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                            loss = self.label_smoother(outputs, labels, shift_labels=True)
+                        else:
+                            loss = self.label_smoother(outputs, labels)
+                    else:
+                        if isinstance(outputs, dict) and "loss" not in outputs:
+                            raise ValueError(
+                                "The model did not return a loss from the inputs, only the following keys: "
+                                f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                            )
+                        # We don't use .loss here since the model may return tuples instead of ModelOutput.
+                        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                        
+                    # Diversity term
+                    if args.divdist == 'manhattan':
+                        dist_matrix = manhattan(outputs.logits.squeeze())
+                    elif args.divdist == 'cosine':
+                        dist_matrix = cossim(outputs.logits.squeeze())
+                    else:
+                        return ValueError(f'Unsupported diversity distance function {args.divdist}')
+                    dist_matrix = dist_matrix.to(outputs.logits.get_device()) / args.divc1
+                    diversity = torch.mean(torch.exp(-dist_matrix)) * args.divc2
+                    print(diversity)
 
-    # Verifying the datatypes and parameter counts before training.
-    print_trainable_parameters(args, model)
-    dtypes = {}
-    for _, p in model.named_parameters():
-        dtype = p.dtype
-        if dtype not in dtypes: dtypes[dtype] = 0
-        dtypes[dtype] += p.numel()
-    total = 0
-    for k, v in dtypes.items(): total+= v
-    for k, v in dtypes.items():
-        print(k, v, v/total)
-
-    all_metrics = {"run_name": args.run_name}
-    # Training
-    if args.do_train:
-        logger.info("*** Train ***")
-        # Note: `resume_from_checkpoint` not supported for adapter checkpoints by HF.
-        # Currently adapter checkpoint is reloaded as expected but optimizer/scheduler states are not.
-        train_result = trainer.train()
-        metrics = train_result.metrics
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-        all_metrics.update(metrics)
-    # Evaluation
-    if args.do_eval:
-        logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate(metric_key_prefix="eval")
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-        all_metrics.update(metrics)
-    # Prediction
-    if args.do_predict:
-        logger.info("*** Predict ***")
-        prediction_output = trainer.predict(test_dataset=data_module['predict_dataset'],metric_key_prefix="predict")
-        prediction_metrics = prediction_output.metrics
-        predictions = prediction_output.predictions
-        predictions = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
-        predictions = tokenizer.batch_decode(
-            predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
+                    return (loss+diversity, outputs) if return_outputs else loss+diversity
+            
+            trainerclass = CustomSeq2SeqTrainer
+        else: trainerclass = Seq2SeqTrainer
+                    
+        
+        trainer = trainerclass(
+            model=model,
+            tokenizer=tokenizer,
+            args=training_args,
+            **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
         )
-        with open(os.path.join(args.output_dir, 'predictions.jsonl'), 'w') as fout:
-            for i, example in enumerate(data_module['predict_dataset']):
-                example['prediction_with_input'] = predictions[i].strip()
-                example['prediction'] = predictions[i].replace(example['input'], '').strip()
-                fout.write(json.dumps(example) + '\n')
-        print(prediction_metrics)
-        trainer.log_metrics("predict", prediction_metrics)
-        trainer.save_metrics("predict", prediction_metrics)
-        all_metrics.update(prediction_metrics)
 
-    if args.do_generate:
-        sample(args, model, data_collator)
+        # Callbacks
+        if not args.full_finetune:
+            trainer.add_callback(SavePeftModelCallback)
+        if args.report_to == ['wandb']:
+            print('adding wandb callback')
+            class WandbMetricsCallback(WandbCallback):
+                def on_substep_end(self, args, state, control, **kwargs):
+                    self._wandb.log(model.to_log)
+                def on_prediction_step(self, args, state, control, **kwargs):
+                    mets = {k+'_eval':model.to_log[k] for k in model.to_log}
+                    self._wandb.log(model.to_log)
+                    
+            trainer.add_callback(WandbMetricsCallback)
+        if args.eval_samples:
+            class evalSampleCallback(transformers.TrainerCallback):
+                def on_evaluate(self, args, state, control, model, **kwargs):
+                    trainer.model.eval()
+                    metrics = trainer.predict(test_dataset=data_module['eval_dataset'],metric_key_prefix="predict")
+                    
+                    predictions = []
+                    for i in range(len(metrics.predictions)):
+                        logit = metrics.predictions[i]
+                        print('logit', logit)
+                        print(logit.shape)
+                        label = metrics.label_ids[i] #just to see positions where prompt tokens are at
+                        print('label', label)
+                        print(label.shape)
+                        logit_abcd = logit[label != IGNORE_INDEX]
+                        toks = np.argmax(logit_abcd, axis=1)
+                        predictions.append(
+                            ''.join(trainer.tokenizer.decode(toks, skip_special_tokens=True, clean_up_tokenization_spaces=True)) + '\n'
+                            )
+                    
+                    with open(os.path.join(args.output_dir, 'samples.txt'), 'a') as f:
+                        f.write(f'step {trainer.state.global_step}\n')
+                        f.writelines(predictions)
+                        f.write('\n\n')
+                        
+                    print('\nsamples logged to ', os.path.join(args.output_dir, 'samples.txt'))
+                    
+            trainer.add_callback(evalSampleCallback)
+        if args.do_mmlu_eval:
+            if args.mmlu_dataset == 'mmlu-zs':
+                mmlu_dataset = load_dataset("json", data_files={
+                    'eval': 'data/mmlu/zero_shot_mmlu_val.json',
+                    'test': 'data/mmlu/zero_shot_mmlu_test.json',
+                })
+                mmlu_dataset = mmlu_dataset.remove_columns('subject')
+            # MMLU Five-shot (Eval/Test only)
+            elif args.mmlu_dataset == 'mmlu' or args.mmlu_dataset == 'mmlu-fs':
+                mmlu_dataset = load_dataset("json", data_files={
+                    'eval': 'data/mmlu/five_shot_mmlu_val.json',
+                    'test': 'data/mmlu/five_shot_mmlu_test.json',
+                })
+                # mmlu_dataset = mmlu_dataset.remove_columns('subject')
+            mmlu_dataset = mmlu_dataset[args.mmlu_split]
+            if args.max_mmlu_samples is not None:
+                mmlu_dataset = mmlu_dataset.select(range(args.max_mmlu_samples))
+            abcd_idx = [
+                tokenizer("A", add_special_tokens=False).input_ids[0],
+                tokenizer("B", add_special_tokens=False).input_ids[0],
+                tokenizer("C", add_special_tokens=False).input_ids[0],
+                tokenizer("D", add_special_tokens=False).input_ids[0],
+            ]
+            accuracy = evaluate.load("accuracy")
+            class MMLUEvalCallback(transformers.TrainerCallback):
+                def on_evaluate(self, args, state, control, model, **kwargs):
+                    data_loader = trainer.get_eval_dataloader(mmlu_dataset)
+                    source_max_len = trainer.data_collator.source_max_len
+                    trainer.data_collator.source_max_len = args.mmlu_source_max_len
+                    trainer.model.eval()
+                    preds, refs = [], []
+                    loss_mmlu = 0
+                    for batch in tqdm(data_loader, total=len(data_loader)):
+                        (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
+                        # There are two tokens, the output, and eos token.
+                        for i, logit in enumerate(logits):
+                            label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
+                            logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                            preds.append(torch.argmax(logit_abcd).item())
+                        labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
+                        refs += [abcd_idx.index(label) for label in labels.tolist()]
+                        loss_mmlu += loss.item()
+                    # Extract results by subject.
+                    results = {'mmlu_loss':loss_mmlu/len(data_loader)}
+                    subject = mmlu_dataset['subject']
+                    subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
+                    for s,p,r in zip(subject, preds, refs):
+                        subjects[s]['preds'].append(p)
+                        subjects[s]['refs'].append(r)
+                    subject_scores = []
+                    for subject in subjects:
+                        subject_score = accuracy.compute(
+                            references=subjects[subject]['refs'],
+                            predictions=subjects[subject]['preds']
+                        )['accuracy']
+                        results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
+                        subject_scores.append(subject_score)
+                    results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
+                    trainer.log(results)
+                    trainer.data_collator.source_max_len = source_max_len
+
+            trainer.add_callback(MMLUEvalCallback)
+
+        # Verifying the datatypes and parameter counts before training.
+        print_trainable_parameters(args, model)
+        dtypes = {}
+        for _, p in model.named_parameters():
+            dtype = p.dtype
+            if dtype not in dtypes: dtypes[dtype] = 0
+            dtypes[dtype] += p.numel()
+        total = 0
+        for k, v in dtypes.items(): total+= v
+        for k, v in dtypes.items():
+            print(k, v, v/total)
+
+        all_metrics = {"run_name": args.run_name}
+        # Training
+        if args.do_train:
+            logger.info("*** Train ***")
+            # Note: `resume_from_checkpoint` not supported for adapter checkpoints by HF.
+            # Currently adapter checkpoint is reloaded as expected but optimizer/scheduler states are not.
+            train_result = trainer.train()
+            metrics = train_result.metrics
+            trainer.log_metrics("train", metrics)
+            trainer.save_metrics("train", metrics)
+            trainer.save_state()
+            all_metrics.update(metrics)
+        # Evaluation
+        if args.do_eval:
+            logger.info("*** Evaluate ***")
+            metrics = trainer.evaluate(metric_key_prefix="eval")
+            trainer.log_metrics("eval", metrics)
+            trainer.save_metrics("eval", metrics)
+            all_metrics.update(metrics)
+        # Prediction
+        if args.do_predict:
+            logger.info("*** Predict ***")
+            prediction_output = trainer.predict(test_dataset=data_module['predict_dataset'],metric_key_prefix="predict")
+            prediction_metrics = prediction_output.metrics
+            predictions = prediction_output.predictions
+            predictions = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
+            predictions = tokenizer.batch_decode(
+                predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )
+            with open(os.path.join(args.output_dir, 'predictions.jsonl'), 'w') as fout:
+                for i, example in enumerate(data_module['predict_dataset']):
+                    example['prediction_with_input'] = predictions[i].strip()
+                    example['prediction'] = predictions[i].replace(example['input'], '').strip()
+                    fout.write(json.dumps(example) + '\n')
+            print(prediction_metrics)
+            trainer.log_metrics("predict", prediction_metrics)
+            trainer.save_metrics("predict", prediction_metrics)
+            all_metrics.update(prediction_metrics)
+
+
+    # if args.do_generate:
+    #     sample(args)
 
     if (args.do_train or args.do_eval or args.do_predict):
         with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
