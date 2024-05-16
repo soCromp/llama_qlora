@@ -8,9 +8,10 @@ import transformers
 import argparse
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from datasets import load_dataset, Dataset, load_from_disk
+from sklearn.metrics.pairwise import cosine_similarity
 
-# import warnings
-# warnings.filterwarnings("ignore")
+import warnings
+warnings.filterwarnings("ignore")
 
 
 hfparser = transformers.HfArgumentParser((
@@ -55,14 +56,16 @@ for f in os.listdir(args.dataset):
 real = full_dataset['train'].to_pandas().drop(['length'], axis=1)
 
 preds = [ [] for _ in range(real.shape[1]) ]
+unmatched = []
 batch_size = 50
 num_samples = 5000 # real.shape[0]
 inputs = collator(batch_size*[{'length': 0}])
 
 print('beginning generation')
 
-for batch in tqdm(range(num_samples//batch_size + 1)):
+for batch in tqdm(range(num_samples//batch_size)):
     _, batch_col_toks = model.generate(**inputs) # batch_size x num_cols x max_column_len
+    unmatched.append(batch_col_toks)
 
     for i, col in enumerate(real.columns):
         options_str = real[col].unique()
@@ -71,5 +74,9 @@ for batch in tqdm(range(num_samples//batch_size + 1)):
         preds_col = options_str[cosine_similarity(batch_col_toks[:, i, :], options).argmax(axis=1)]
         preds[i].extend(preds_col)
         
-    hp = Dataset.from_pandas(pd.DataFrame(preds).T)
-    hp.save_to_disk(path)
+    if batch % 500 == 0:
+        unmatched_np = np.concatenate(unmatched, axis=0)
+        unmatched_np.tofile(os.path.join(path, 'raw_np'))
+        df = pd.DataFrame(preds).T
+        hp = Dataset.from_pandas(df)
+        hp.save_to_disk(path)
