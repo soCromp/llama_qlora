@@ -410,7 +410,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                 cache_position=cache_position,
             )
 
-            hidden_states = outputs[0] # batch_size x tokens x 4096
+            hidden_states = outputs[0].to(torch.bfloat16) # batch_size x tokens x 4096
             # print(hidden_states.shape)
 
             if self.config.pretraining_tp > 1:
@@ -684,7 +684,7 @@ class MultiheadLlamaForCausalLM(LlamaPreTrainedModel):
                 print(next_tokens)
                 
                 
-            input_ids = torch.cat([input_ids, next_tokens], dim=-1)
+            input_ids = torch.cat([input_ids, next_tokens.to(input_ids.device)], dim=-1)
 
             # finished sentences should have their next token be a padding token TODO
             
