@@ -29,6 +29,7 @@ import argparse
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
+    AutoModelForMaskedLM,
     set_seed,
     Seq2SeqTrainer,
     BitsAndBytesConfig,
@@ -96,6 +97,10 @@ class ModelArguments:
     model_name_or_path: Optional[str] = field(
         default="EleutherAI/pythia-12b"
     )
+    task: Optional[str] = field(
+        default='causal',
+        metadata={'help': 'Task: set to causal if using llama model, or masked for Bert etc'}
+    )
     trust_remote_code: Optional[bool] = field(
         default=False,
         metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
@@ -103,15 +108,6 @@ class ModelArguments:
     num_heads: Optional[int] = field(
         default=1,
         metadata={'help': 'Number of heads (>=1) to put on the model. 1 results in normal model, more constructs multiheaded model.'}
-    )
-    head_assembly: Optional[str] = field(
-        default='follow',
-        metadata={'help': 'Whether heads should re-generate the input tokens and where to put their column predictions relative to the (if any) input tokens. One of: \
-            follow (follow prompt), just (just column preds) or correct (put inside the prompt)'}
-    )
-    head_loss: Optional[str] = field(
-        default='rearrange',
-        metadata={'help': 'How to compare head outputs to the labels. One of: rearrange (insert into cloze prompt sentence), pull (pull out of cloze prompt sentence)'}
     )
 
 @dataclass
@@ -364,49 +360,50 @@ def get_accelerate_model(args, checkpoint_dir):
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
     
     model = None
+    config = None
+    AutoModelsDict = {'causal': AutoModelForCausalLM, 'masked': AutoModelForMaskedLM}
+    
     if args.num_heads > 1:
         config = MHLlamaConfig(**vars(args))
         # model = num_headsLlamaForCausalLM(args.num_heads, config)
         transformers.AutoConfig.register('mhllama', MHLlamaConfig)
         transformers.AutoModelForCausalLM.register(MHLlamaConfig, MultiheadLlamaForCausalLM)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            config = config,
-            # cache_dir=args.cache_dir,
-            device_map=device_map,
-            max_memory=max_memory,
-            quantization_config=BitsAndBytesConfig(
-                load_in_4bit=args.bits == 4,
-                load_in_8bit=args.bits == 8,
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_use_double_quant=args.double_quant,
-                bnb_4bit_quant_type=args.quant_type,
-            ),
-            torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
-        )
-        print('MH llama has', model.num_heads, 'heads')
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            # cache_dir=args.cache_dir,
-            device_map=device_map,
-            max_memory=max_memory,
-            quantization_config=BitsAndBytesConfig(
-                load_in_4bit=args.bits == 4,
-                load_in_8bit=args.bits == 8,
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_use_double_quant=args.double_quant,
-                bnb_4bit_quant_type=args.quant_type,
-            ),
-            torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
-            trust_remote_code=args.trust_remote_code,
-            # use_auth_token=args.use_auth_token
-        )
-        print(model)
+        # model = AutoModelForCausalLM.from_pretrained(
+        #     args.model_name_or_path,
+        #     config = config,
+        #     device_map=device_map,
+        #     max_memory=max_memory,
+        #     quantization_config=BitsAndBytesConfig(
+        #         load_in_4bit=args.bits == 4,
+        #         load_in_8bit=args.bits == 8,
+        #         llm_int8_threshold=6.0,
+        #         llm_int8_has_fp16_weight=False,
+        #         bnb_4bit_compute_dtype=compute_dtype,
+        #         bnb_4bit_use_double_quant=args.double_quant,
+        #         bnb_4bit_quant_type=args.quant_type,
+        #     ),
+        #     torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        # )
+        
+    model = AutoModelsDict[args.task].from_pretrained(
+        args.model_name_or_path,
+        config = config,
+        device_map=device_map,
+        max_memory=max_memory,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=args.bits == 4,
+            load_in_8bit=args.bits == 8,
+            llm_int8_threshold=6.0,
+            llm_int8_has_fp16_weight=False,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=args.double_quant,
+            bnb_4bit_quant_type=args.quant_type,
+        ),
+        torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)),
+        trust_remote_code=args.trust_remote_code,
+    )
+        
+    print(model)
         
     if compute_dtype == torch.float16 and args.bits == 4:
         if torch.cuda.is_bf16_supported():
@@ -454,8 +451,9 @@ def get_accelerate_model(args, checkpoint_dir):
                 "unk_token": tokenizer.convert_ids_to_tokens(
                     model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
                 ),
-                "cls_token": tokenizer.convert_ids_to_tokens(model.config.col_token_id)
         })
+        if args.num_heads > 1:
+            tokenizer.add_special_tokens({"cls_token": tokenizer.convert_ids_to_tokens(model.config.col_token_id)})
     
     if not args.full_finetune:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
@@ -794,16 +792,25 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         # if args.group_by_length:
         #     train_dataset = train_dataset.map(lambda x: {'length': len(x['input']) + len(x['output'])})
 
-    data_collator = DataCollatorForMHLM(
-        tokenizer=tokenizer,
-        source_max_len=args.source_max_len,
-        target_max_len=args.target_max_len,
-        train_on_source=args.train_on_source,
-        predict_with_generate=args.predict_with_generate,
-        prompt = dataset['prompt']['prompt'],
-        vocab_masks = dataset['vocab_masks'], # {'1':32000-list, '2':32000-list, etc}
-        max_column_len = args.generation_config.max_column_len,
-    )
+    if 'prompt' in dataset:
+        data_collator = DataCollatorForMHLM(
+            tokenizer=tokenizer,
+            source_max_len=args.source_max_len,
+            target_max_len=args.target_max_len,
+            train_on_source=args.train_on_source,
+            predict_with_generate=args.predict_with_generate,
+            prompt = dataset['prompt']['prompt'],
+            vocab_masks = dataset['vocab_masks'], # {'1':32000-list, '2':32000-list, etc}
+            max_column_len = args.generation_config.max_column_len,
+        )
+    else:
+        data_collator = DataCollatorForCausalLM(
+            tokenizer=tokenizer,
+            source_max_len=args.source_max_len,
+            target_max_len=args.target_max_len,
+            train_on_source=args.train_on_source,
+            predict_with_generate=args.predict_with_generate,
+        )
     return dict(
         train_dataset=train_dataset if args.do_train or args.do_generate else None,
         eval_dataset=eval_dataset if args.do_eval else None,
@@ -898,64 +905,65 @@ def train():
         set_seed(args.seed)
 
         data_module = make_data_module(tokenizer=tokenizer, args=args)
-        model.set_templates(data_module['data_collator'].get_templates()) # head_inds and prompt_template
         
         if args.num_heads > 1:
+            model.set_templates(data_module['data_collator'].get_templates()) # head_inds and prompt_template
             do_mlm_sample=True # controls whether to do multihead-style sampling, will be passed as generation arg
         
-        if args.diversity:
-            class CustomSeq2SeqTrainer(Seq2SeqTrainer):
-                def compute_loss(self, model, inputs, return_outputs=False):
-                    """
-                    How the loss is computed by Trainer. By default, all models return the loss in the first element.
+        # if args.diversity:
+        #     class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+        #         def compute_loss(self, model, inputs, return_outputs=False):
+        #             """
+        #             How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
-                    Subclass and override for custom behavior.
-                    """
-                    if self.label_smoother is not None and "labels" in inputs:
-                        labels = inputs.pop("labels")
-                    else:
-                        labels = None
-                    outputs = model(**inputs)
+        #             Subclass and override for custom behavior.
+        #             """
+        #             if self.label_smoother is not None and "labels" in inputs:
+        #                 labels = inputs.pop("labels")
+        #             else:
+        #                 labels = None
+        #             outputs = model(**inputs)
                     
-                    # Save past state if it exists
-                    # TODO: this needs to be fixed and made cleaner later.
-                    if self.args.past_index >= 0:
-                        self._past = outputs[self.args.past_index]
+        #             # Save past state if it exists
+        #             # TODO: this needs to be fixed and made cleaner later.
+        #             if self.args.past_index >= 0:
+        #                 self._past = outputs[self.args.past_index]
 
-                    if labels is not None:
-                        unwrapped_model = unwrap_model(model)
-                        if is_peft_available() and isinstance(unwrapped_model, PeftModel):
-                            model_name = unwrapped_model.base_model.model._get_name()
-                        else:
-                            model_name = unwrapped_model._get_name()
-                        if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
-                            loss = self.label_smoother(outputs, labels, shift_labels=True)
-                        else:
-                            loss = self.label_smoother(outputs, labels)
-                    else:
-                        if isinstance(outputs, dict) and "loss" not in outputs:
-                            raise ValueError(
-                                "The model did not return a loss from the inputs, only the following keys: "
-                                f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-                            )
-                        # We don't use .loss here since the model may return tuples instead of ModelOutput.
-                        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        #             if labels is not None:
+        #                 unwrapped_model = unwrap_model(model)
+        #                 if is_peft_available() and isinstance(unwrapped_model, PeftModel):
+        #                     model_name = unwrapped_model.base_model.model._get_name()
+        #                 else:
+        #                     model_name = unwrapped_model._get_name()
+        #                 if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+        #                     loss = self.label_smoother(outputs, labels, shift_labels=True)
+        #                 else:
+        #                     loss = self.label_smoother(outputs, labels)
+        #             else:
+        #                 if isinstance(outputs, dict) and "loss" not in outputs:
+        #                     raise ValueError(
+        #                         "The model did not return a loss from the inputs, only the following keys: "
+        #                         f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+        #                     )
+        #                 # We don't use .loss here since the model may return tuples instead of ModelOutput.
+        #                 loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
                         
-                    # Diversity term
-                    if args.divdist == 'manhattan':
-                        dist_matrix = manhattan(outputs.logits.squeeze())
-                    elif args.divdist == 'cosine':
-                        dist_matrix = cossim(outputs.logits.squeeze())
-                    else:
-                        return ValueError(f'Unsupported diversity distance function {args.divdist}')
-                    dist_matrix = dist_matrix.to(outputs.logits.get_device()) / args.divc1
-                    diversity = torch.mean(torch.exp(-dist_matrix)) * args.divc2
-                    print(diversity)
+        #             # Diversity term
+        #             if args.divdist == 'manhattan':
+        #                 dist_matrix = manhattan(outputs.logits.squeeze())
+        #             elif args.divdist == 'cosine':
+        #                 dist_matrix = cossim(outputs.logits.squeeze())
+        #             else:
+        #                 return ValueError(f'Unsupported diversity distance function {args.divdist}')
+        #             dist_matrix = dist_matrix.to(outputs.logits.get_device()) / args.divc1
+        #             diversity = torch.mean(torch.exp(-dist_matrix)) * args.divc2
+        #             print(diversity)
 
-                    return (loss+diversity, outputs) if return_outputs else loss+diversity
+        #             return (loss+diversity, outputs) if return_outputs else loss+diversity
             
-            trainerclass = CustomSeq2SeqTrainer
-        else: trainerclass = Seq2SeqTrainer
+        #     trainerclass = CustomSeq2SeqTrainer
+        # else: 
+        trainerclass = Seq2SeqTrainer
                     
         
         trainer = trainerclass(
@@ -987,11 +995,11 @@ def train():
                     predictions = []
                     for i in range(len(metrics.predictions)):
                         logit = metrics.predictions[i]
-                        print('logit', logit)
-                        print(logit.shape)
+                        # print('logit', logit)
+                        # print(logit.shape)
                         label = metrics.label_ids[i] #just to see positions where prompt tokens are at
-                        print('label', label)
-                        print(label.shape)
+                        # print('label', label)
+                        # print(label.shape)
                         logit_abcd = logit[label != IGNORE_INDEX]
                         toks = np.argmax(logit_abcd, axis=1)
                         predictions.append(
